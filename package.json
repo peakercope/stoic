@@ -1,0 +1,26 @@
+{
+  "name": "stoic-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "yarn workspace stoic build",
+    "dev": "yarn workspace stoic dev",
+    "play": "yarn workspace playground dev",
+    "test": "yarn workspace stoic test",
+    "typecheck": "yarn workspace stoic typecheck && yarn workspace playground typecheck",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "yarn build && changeset publish"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.7",
+    "@changesets/cli": "^2.31.0",
+    "@tsconfig/strictest": "^2.0.8",
+    "@types/node": "^25.3.5",
+    "typescript": "^6.0.3"
+  },
+  "packageManager": "yarn@4.17.0"
+}
