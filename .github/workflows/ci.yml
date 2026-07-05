@@ -21,7 +21,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Enable Corepack
         run: corepack enable
@@ -30,7 +30,7 @@ jobs:
         run: yarn install --immutable
 
       - name: Typecheck
-        run: yarn workspace stoic typecheck
+        run: yarn workspace stoic-store typecheck
 
       - name: Test
         run: yarn test

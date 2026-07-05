@@ -37,9 +37,9 @@ The key difference from most state managers: Stoic tracks the relationships betw
 ## Installation
 
 ```bash
-npm install stoic
+npm install stoic-store
 # or
-yarn add stoic
+yarn add stoic-store
 ```
 
 Stoic requires React 18.3 or later (it uses `useSyncExternalStore`).
@@ -51,7 +51,7 @@ Stoic requires React 18.3 or later (it uses `useSyncExternalStore`).
 Create a store with state, derived values, and actions:
 
 ```ts
-import { createStore } from "stoic";
+import { createStore } from "stoic-store";
 
 type CartItem = {
   id: number;
@@ -161,7 +161,7 @@ const total = cart.useStore((state) => state.total);
 When a selector returns an object or array, it's a new reference on every render, so pass an equality function as the second argument to avoid rerendering when the contents haven't actually changed. Stoic ships a `shallow` helper for this:
 
 ```tsx
-import { shallow } from "stoic/tools";
+import { shallow } from "stoic-store/tools";
 
 const { subtotal, total } = cart.useStore(
   (state) => ({ subtotal: state.subtotal, total: state.total }),
@@ -305,8 +305,8 @@ The core of Stoic only handles state, derived state, and actions. Everything els
 `persist` saves your store to storage and restores it on load:
 
 ```tsx
-import { createStore } from "stoic";
-import { persist } from "stoic/plugins";
+import { createStore } from "stoic-store";
+import { persist } from "stoic-store/plugins";
 
 const settings = createStore({
   state: {

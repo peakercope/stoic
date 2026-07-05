@@ -1,5 +1,5 @@
 {
-  "name": "stoic",
+  "name": "stoic-store",
   "type": "module",
   "version": "0.0.1",
   "description": "Minimal and powerful React state manager. Tiny, intuitive, and fully TypeScript-ready.",

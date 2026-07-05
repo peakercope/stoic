@@ -24,17 +24,20 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Enable Corepack
         run: corepack enable
 
+      - name: Update npm for OIDC trusted publishing support
+        run: npm install -g npm@latest
+
       - name: Install dependencies
         run: yarn install --immutable
 
       - name: Typecheck
-        run: yarn workspace stoic typecheck
+        run: yarn workspace stoic-store typecheck
 
       - name: Test
         run: yarn test
@@ -46,5 +49,3 @@ jobs:
           version: yarn version-packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { createStore } from "stoic";
-import { persist } from "stoic/plugins";
+import { createStore } from "stoic-store";
+import { persist } from "stoic-store/plugins";
 
 const tax = 0.2;
 const discount = 0.1;

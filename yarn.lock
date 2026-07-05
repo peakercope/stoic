@@ -1967,7 +1967,7 @@ __metadata:
     "@vitejs/plugin-react": "npm:^6.0.1"
     react: "npm:^18.0.0"
     react-dom: "npm:^18.0.0"
-    stoic: "workspace:*"
+    stoic-store: "workspace:*"
     vite: "npm:^8.1.3"
   languageName: unknown
   linkType: soft
@@ -2272,21 +2272,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"stoic-workspace@workspace:.":
+"stoic-store@workspace:*, stoic-store@workspace:packages/stoic":
   version: 0.0.0-use.local
-  resolution: "stoic-workspace@workspace:."
-  dependencies:
-    "@biomejs/biome": "npm:2.4.7"
-    "@changesets/cli": "npm:^2.31.0"
-    "@tsconfig/strictest": "npm:^2.0.8"
-    "@types/node": "npm:^25.3.5"
-    typescript: "npm:^6.0.3"
-  languageName: unknown
-  linkType: soft
-
-"stoic@workspace:*, stoic@workspace:packages/stoic":
-  version: 0.0.0-use.local
-  resolution: "stoic@workspace:packages/stoic"
+  resolution: "stoic-store@workspace:packages/stoic"
   dependencies:
     "@types/react": "npm:^18.0.0"
     "@types/react-dom": "npm:^18.0.0"
@@ -2301,6 +2289,18 @@ __metadata:
   peerDependencies:
     react: ^18.0.0
     react-dom: ^18.0.0
+  languageName: unknown
+  linkType: soft
+
+"stoic-workspace@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "stoic-workspace@workspace:."
+  dependencies:
+    "@biomejs/biome": "npm:2.4.7"
+    "@changesets/cli": "npm:^2.31.0"
+    "@tsconfig/strictest": "npm:^2.0.8"
+    "@types/node": "npm:^25.3.5"
+    typescript: "npm:^6.0.3"
   languageName: unknown
   linkType: soft
 
