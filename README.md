@@ -42,7 +42,7 @@ npm install stoic-store
 yarn add stoic-store
 ```
 
-Stoic requires React 18.3 or later (it uses `useSyncExternalStore`).
+Stoic requires React 18 or later (it uses `useSyncExternalStore`).
 
 ---
 
