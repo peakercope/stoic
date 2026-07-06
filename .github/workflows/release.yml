@@ -37,7 +37,7 @@ jobs:
         run: yarn install --immutable
 
       - name: Typecheck
-        run: yarn workspace stoic-store typecheck
+        run: yarn typecheck
 
       - name: Test
         run: yarn test

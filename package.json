@@ -1,26 +1,70 @@
 {
-  "name": "stoic-workspace",
-  "private": true,
+  "name": "stoic-store",
   "type": "module",
-  "workspaces": [
-    "packages/*"
+  "version": "0.0.2",
+  "description": "Minimal and powerful React state manager. Tiny, intuitive, and fully TypeScript-ready.",
+  "author": "peakercope <peakercope@gmail.com> (https://github.com/peakercope)",
+  "license": "MIT",
+  "keywords": [
+    "react",
+    "state",
+    "state-management",
+    "store",
+    "derived-state",
+    "typescript"
   ],
+  "homepage": "https://github.com/peakercope/stoic#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/peakercope/stoic.git"
+  },
+  "bugs": {
+    "url": "https://github.com/peakercope/stoic/issues"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./plugins": "./dist/plugins.js",
+    "./tools": "./dist/tools.js",
+    "./package.json": "./package.json"
+  },
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "!dist/**/*.map"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "yarn workspace stoic-store build",
-    "dev": "yarn workspace stoic-store dev",
-    "play": "yarn workspace playground dev",
-    "test": "yarn workspace stoic-store test",
-    "typecheck": "yarn workspace stoic-store typecheck && yarn workspace playground typecheck",
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "yarn build && changeset publish"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.7",
     "@changesets/cli": "^2.31.0",
     "@tsconfig/strictest": "^2.0.8",
     "@types/node": "^25.3.5",
-    "typescript": "^6.0.3"
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@vitejs/plugin-react": "^6.0.3",
+    "@vitest/coverage-v8": "^4.1.9",
+    "happy-dom": "^20.8.4",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "tsdown": "^0.22.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3",
+    "vitest": "^4.1.9"
   },
   "packageManager": "yarn@4.17.0"
 }
