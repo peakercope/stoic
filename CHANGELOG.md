@@ -1,5 +1,11 @@
 # stoic
 
+## 0.1.1
+
+### Patch Changes
+
+- 445e807: Update peer dependencies
+
 ## 0.1.0
 
 ### Minor Changes
