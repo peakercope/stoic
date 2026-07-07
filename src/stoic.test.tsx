@@ -174,7 +174,7 @@ describe("derived", () => {
     const finalPrice = vi.fn(
       (s: { total: number; discount: number }) => s.total * (1 - s.discount),
     );
-    const { getState, setState } = createStore<
+    const { getState, setState, subscribe } = createStore<
       { price: number; count: number; tax: number; discount: number },
       { subtotal: number; total: number; finalPrice: number }
     >({
@@ -185,6 +185,7 @@ describe("derived", () => {
         finalPrice: (s) => finalPrice(s),
       },
     });
+    subscribe(vi.fn());
     subtotal.mockClear();
     total.mockClear();
     finalPrice.mockClear();
@@ -203,7 +204,7 @@ describe("derived", () => {
     const finalPrice = vi.fn(
       (s: { total: number; discount: number }) => s.total * (1 - s.discount),
     );
-    const { setState } = createStore<
+    const { setState, subscribe } = createStore<
       { price: number; count: number; tax: number; discount: number },
       { subtotal: number; total: number; finalPrice: number }
     >({
@@ -214,6 +215,7 @@ describe("derived", () => {
         finalPrice: (s) => finalPrice(s),
       },
     });
+    subscribe(vi.fn());
     subtotal.mockClear();
     total.mockClear();
     finalPrice.mockClear();
@@ -228,13 +230,14 @@ describe("derived", () => {
   it("does not cascade when a recomputed derived value is unchanged", () => {
     const parity = vi.fn((s: { n: number }) => s.n % 2);
     const label = vi.fn((s: { parity: number }) => (s.parity === 0 ? "even" : "odd"));
-    const { setState } = createStore<{ n: number }, { parity: number; label: string }>({
+    const { setState, subscribe } = createStore<{ n: number }, { parity: number; label: string }>({
       state: { n: 2 },
       derived: {
         parity: (s) => parity(s),
         label: (s) => label(s),
       },
     });
+    subscribe(vi.fn());
     parity.mockClear();
     label.mockClear();
 
@@ -262,6 +265,149 @@ describe("derived", () => {
     setState({ other: 1 });
 
     expect(doubled).not.toHaveBeenCalled();
+  });
+});
+
+// ─── lazy/mount-aware derived recomputation ───────────────────────────────────
+
+describe("lazy/mount-aware derived recomputation", () => {
+  it("does not recompute derived values while the store has no listeners", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+    doubled.mockClear();
+
+    setState({ count: 2 });
+    setState({ count: 3 });
+
+    expect(doubled).not.toHaveBeenCalled();
+  });
+
+  it("coalesces multiple unobserved setState calls into a single recompute", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+    doubled.mockClear();
+
+    setState({ count: 2 });
+    setState({ count: 3 });
+    setState({ count: 4 });
+
+    expect(doubled).not.toHaveBeenCalled();
+    expect(getState().doubled).toBe(8);
+    expect(doubled).toHaveBeenCalledTimes(1);
+  });
+
+  it("getState() flushes pending recomputation and returns a fresh value", () => {
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+
+    setState({ count: 5 });
+
+    expect(getState().doubled).toBe(10);
+  });
+
+  it("subscribing flushes pending state without invoking the new listener immediately", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState, setState, subscribe } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+    doubled.mockClear();
+
+    setState({ count: 5 });
+    expect(doubled).not.toHaveBeenCalled();
+
+    const listener = vi.fn();
+    subscribe(listener);
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(getState().doubled).toBe(10);
+    expect(doubled).toHaveBeenCalledTimes(1);
+  });
+
+  it("recomputes eagerly on every setState once a listener is attached", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { setState, subscribe } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+    subscribe(vi.fn());
+    doubled.mockClear();
+
+    setState({ count: 2 });
+    expect(doubled).toHaveBeenCalledTimes(1);
+
+    setState({ count: 3 });
+    expect(doubled).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to deferred recomputation after the last listener unsubscribes", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState, setState, subscribe } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+    const unsubscribe = subscribe(vi.fn());
+    unsubscribe();
+    doubled.mockClear();
+
+    setState({ count: 9 });
+
+    expect(doubled).not.toHaveBeenCalled();
+    expect(getState().doubled).toBe(18);
+  });
+
+  it("a plugin implementing afterSetState forces eager recomputation with no listeners", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const afterSetState = vi.fn();
+    const { setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+      plugins: [{ afterSetState }],
+    });
+    doubled.mockClear();
+    afterSetState.mockClear();
+
+    setState({ count: 2 });
+
+    expect(doubled).toHaveBeenCalledTimes(1);
+    expect(afterSetState).toHaveBeenCalledWith(expect.objectContaining({ count: 2, doubled: 4 }));
+  });
+
+  it("a plugin without afterSetState does not force eager recomputation", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const onDestroy = vi.fn();
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+      plugins: [{ onDestroy }],
+    });
+    doubled.mockClear();
+
+    setState({ count: 2 });
+
+    expect(doubled).not.toHaveBeenCalled();
+    expect(getState().doubled).toBe(4);
+  });
+
+  it("defers the CircularDependencyError throw to the next getState() when unobserved", () => {
+    const { getState, setState } = createStore<{ flag: boolean }, { a: number; b: number }>({
+      state: { flag: false },
+      derived: {
+        a: (s) => (s.flag ? s.b + 1 : 0),
+        b: (s) => (s.flag ? s.a + 1 : 0),
+      },
+    });
+
+    expect(() => setState({ flag: true })).not.toThrow();
+    expect(() => getState()).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 });
 
@@ -305,14 +451,15 @@ describe("circular dependency detection", () => {
     expect(create).toThrow(new CircularDependencyError(["a", "a"]));
   });
 
-  it("throws once a cycle only manifests via a later setState", () => {
-    const { setState } = createStore<{ flag: boolean }, { a: number; b: number }>({
+  it("throws once a cycle only manifests via a later setState, observed by a listener", () => {
+    const { setState, subscribe } = createStore<{ flag: boolean }, { a: number; b: number }>({
       state: { flag: false },
       derived: {
         a: (s) => (s.flag ? s.b + 1 : 0),
         b: (s) => (s.flag ? s.a + 1 : 0),
       },
     });
+    subscribe(vi.fn());
 
     expect(() => setState({ flag: true })).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });

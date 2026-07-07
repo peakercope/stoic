@@ -13,6 +13,11 @@ No reducers • No dependency arrays • No boilerplate • Fully typed • Plug
 </p>
 
 <p align="center">
+<img src="https://badgen.net/bundlephobia/minzip/stoic-store" />
+<img src="https://badgen.net/github/license/peakercope/stoic" />
+</p>
+
+<p align="center">
 <a href="#quick-start">Quick Start</a> •
 <a href="#core-concepts">Core Concepts</a> •
 <a href="#derived-state">Derived State</a> •
@@ -178,13 +183,13 @@ You can also pass any custom `(a, b) => boolean` function instead of `shallow`.
 Actions update the store. Instead of dispatching action objects, you call a plain function:
 
 ```tsx
-setTax(0.1);
+setTax(0.15);
 ```
 
 Every action receives `setState` as its first argument, followed by whatever arguments you call it with. `setState` accepts either a partial state object or an updater function that reads the current state:
 
 ```tsx
-cart.actions({
+const { increment, removeItem } = cart.actions({
   increment: (setState) => {
     setState((s) => ({ tax: s.tax + 0.01 }));
   },
@@ -282,17 +287,21 @@ const cart = createStore({
 
 Stoic builds a dependency graph from this: `items → subtotal → total → finalPrice`, with `tax` feeding into `total` and `discount` feeding into `finalPrice`. When state changes, only the derived values downstream of that change are recomputed:
 
-```
-setDiscount(0.2)              setTax(0.25)
-─────────────────             ─────────────────
-subtotal   (unchanged)        subtotal   (unchanged)
-total      (unchanged)        total      recomputed
-finalPrice recomputed         finalPrice recomputed
-```
+| setDiscount(0.2) || setTax(0.25) |
+| :---: |:-:| :---: |
+| ❌ || ❌ |
+| *subtotal* (unchanged) || *subtotal* (unchanged) |
+| ❌ || ✅ |
+| *total* (unchanged) || *total* (recomputed) |
+| ✅ || ✅ |
+| *finalPrice* (recomputed) || *finalPrice* (recomputed) |
+
 
 There are no dependency arrays to maintain and nothing to memoize by hand — Stoic tracks which state each derived value reads and invalidates only what's affected.
 
-> **Note:** Derived values are recomputed in declaration order, in a single pass — not resolved as a dependency graph at runtime. If a derived key reads another derived key, it must be declared *after* it (as `total` is declared after `subtotal` above), or it will see a stale value. If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` rather than looping forever.
+> Derived values are recomputed in declaration order, in a single pass — not resolved as a dependency graph at runtime. If a derived key reads another derived key, it must be declared *after* it (as `total` is declared after `subtotal` above), or it will see a stale value. 
+
+> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` rather than looping forever.
 
 ---
 

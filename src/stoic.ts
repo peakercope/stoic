@@ -124,6 +124,13 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   const dependencies = new Map<string, Set<string>>();
 
+  // Plugins are fixed for the store's lifetime, so this is computed once.
+  const hasAfterSetStateHook = plugins.some((p) => typeof p.afterSetState === "function");
+  const isObserved = () => hasAfterSetStateHook || listeners.size > 0;
+
+  // Raw keys changed since the last flush while unobserved; null = nothing pending.
+  let pendingDirty: Set<string> | null = null;
+
   const recomputeDerived = (dirty: Set<string> | null) => {
     let recomputedAny = false;
 
@@ -162,7 +169,20 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   recomputeDerived(null);
 
-  const getState = () => state;
+  // Coalesces derived recomputation deferred while the store was unobserved.
+  // Any CircularDependencyError that only manifests via a deferred write is
+  // thrown here instead of from the setState call that caused it.
+  const flush = () => {
+    if (pendingDirty === null) return;
+    const dirty = pendingDirty;
+    pendingDirty = null;
+    recomputeDerived(dirty);
+  };
+
+  const getState = () => {
+    flush();
+    return state;
+  };
 
   const setState: SetState<T, Full> = (partial) => {
     const prevState = state;
@@ -184,17 +204,29 @@ function internal__createStore<T extends object, D extends object = Record<never
       }
     }
 
-    recomputeDerived(dirty);
+    if (isObserved()) {
+      if (pendingDirty !== null) {
+        for (const k of pendingDirty) dirty.add(k);
+        pendingDirty = null;
+      }
 
-    runHooks("afterSetState", state);
+      recomputeDerived(dirty);
 
-    listeners.forEach((l) => {
-      l(state);
-    });
+      runHooks("afterSetState", state);
+
+      listeners.forEach((l) => {
+        l(state);
+      });
+    } else {
+      if (pendingDirty === null) pendingDirty = new Set();
+      for (const k of dirty) pendingDirty.add(k);
+    }
   };
 
   const subscribe = (listener: Listener<Full>) => {
+    const wasObserved = isObserved();
     listeners.add(listener);
+    if (!wasObserved) flush();
     return () => listeners.delete(listener);
   };
 
