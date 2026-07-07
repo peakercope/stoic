@@ -1,5 +1,11 @@
 # stoic
 
+## 0.3.0
+
+### Minor Changes
+
+- 0ef91d4: Add devtools plugin
+
 ## 0.2.0
 
 ### Minor Changes
