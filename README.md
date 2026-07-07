@@ -272,7 +272,7 @@ Derived values can depend on each other, too. Extending the cart example with a 
 ```tsx
 const cart = createStore({
   state: {
-    items: [] as CartItem[],
+    items: [],
     tax: 0.2,
     discount: 0.1,
   },
@@ -319,7 +319,7 @@ import { devtools } from "stoic-store/plugins";
 
 const cart = createStore({
   state: {
-    items: [] as CartItem[],
+    items: [],
     tax: 0.2,
   },
 
