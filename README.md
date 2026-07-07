@@ -189,12 +189,14 @@ setTax(0.15);
 Every action receives `setState` as its first argument, followed by whatever arguments you call it with. `setState` accepts either a partial state object or an updater function that reads the current state:
 
 ```tsx
-const { increment, removeItem } = cart.actions({
-  increment: (setState) => {
-    setState((s) => ({ tax: s.tax + 0.01 }));
-  },
+const { addItem, removeItem, clearCart } = cart.actions({
+  addItem: (setState, item: CartItem) => {
+    setState((s) => ({ items: [...s.items, item] }));
   removeItem: (setState, id: number) => {
     setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+  },
+  clearCart: (setState) => {
+    setState({ items: [] });
   },
 });
 ```
@@ -208,9 +210,11 @@ Action arguments and store state are both fully typed, so your editor infers the
 An action can be asynchronous — just make the function `async` and call `setState` whenever you have new data:
 
 ```tsx
-const users = createStore({
+type User = { id: number; name: string };
+
+const users = createStore<{ user: User | null }>({
   state: {
-    user: null as { id: number; name: string } | null,
+    user: null,
   },
 });
 
