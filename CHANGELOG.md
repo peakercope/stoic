@@ -1,5 +1,11 @@
 # stoic
 
+## 0.2.0
+
+### Minor Changes
+
+- 7bdece6: Add lazy/mount-aware derived recomputation
+
 ## 0.1.1
 
 ### Patch Changes
