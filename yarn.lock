@@ -594,6 +594,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@redux-devtools/extension@npm:^4.0.0":
+  version: 4.0.0
+  resolution: "@redux-devtools/extension@npm:4.0.0"
+  peerDependencies:
+    redux: ^3.1.0 || ^4.0.0 || ^5.0.0
+  checksum: 10c0/bb3b5b48245f4eb40ffc4384df31f7fe1a14cff2749f8a4058ae5d266436f33e1e97f633daf724e131fc69edfa5c2bcd0f9562bdf9493058fec813641961ccb6
+  languageName: node
+  linkType: hard
+
 "@rolldown/binding-android-arm64@npm:1.1.4":
   version: 1.1.4
   resolution: "@rolldown/binding-android-arm64@npm:1.1.4"
@@ -2233,6 +2242,7 @@ __metadata:
   dependencies:
     "@biomejs/biome": "npm:2.4.7"
     "@changesets/cli": "npm:^2.31.0"
+    "@redux-devtools/extension": "npm:^4.0.0"
     "@tsconfig/strictest": "npm:^2.0.8"
     "@types/node": "npm:^25.3.5"
     "@types/react": "npm:^19.2.17"

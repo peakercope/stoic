@@ -34,7 +34,7 @@ The key difference from most state managers: Stoic tracks the relationships betw
 * ⚡️ Plain function actions — no dispatch, no action types
 * 🧠 Reactive derived state with automatic dependency tracking
 * 🚀 First-class async actions, with built-in pending/error status
-* 🔌 A small plugin system (`persist` is included; write your own for the rest)
+* 🔌 A small plugin system (`persist` and `devtools` are included; write your own for the rest)
 * 💙 Fully typed, with state and action arguments inferred by your editor
 
 ---
@@ -308,6 +308,34 @@ There are no dependency arrays to maintain and nothing to memoize by hand — St
 ## Plugins
 
 The core of Stoic only handles state, derived state, and actions. Everything else — persistence, logging, devtools — is a plugin, so you only pay for what you use.
+
+### Built-in: `devtools`
+
+`devtools` connects a store to the [Redux DevTools](https://github.com/reduxjs/redux-devtools) browser extension, so you can inspect state, see every action as it fires, and time-travel through history:
+
+```tsx
+import { createStore } from "stoic-store";
+import { devtools } from "stoic-store/plugins";
+
+const cart = createStore({
+  state: {
+    items: [] as CartItem[],
+    tax: 0.2,
+  },
+
+  plugins: [devtools({ name: "cart" })],
+});
+```
+
+Every entry in the DevTools log is tagged with the name of the action that produced it (`setTax`, `addItem`, ...); a `setState` call made outside of an action shows up as `"anonymous"`. Time-travel (jumping to a past state, resetting, importing a state) is applied back to the store automatically. `devtools` accepts:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | an auto-generated, unique per-store name | Instance name shown in the DevTools dropdown. |
+| `enabled` | `boolean` | `true` outside of `NODE_ENV=production` | Whether to connect to the extension at all. |
+| `anonymousActionType` | `string` | `"anonymous"` | Label used for `setState` calls made outside of an action. |
+
+If the Redux DevTools extension isn't installed, `devtools` is a no-op — your store behaves exactly as if the plugin weren't there.
 
 ### Built-in: `persist`
 

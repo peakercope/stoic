@@ -53,6 +53,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.4.7",
     "@changesets/cli": "^2.31.0",
+    "@redux-devtools/extension": "^4.0.0",
     "@tsconfig/strictest": "^2.0.8",
     "@types/node": "^25.3.5",
     "@types/react": "^19.2.17",
