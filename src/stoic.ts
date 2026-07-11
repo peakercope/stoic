@@ -76,12 +76,26 @@ type ActionHandlesFor<M extends ActionMap<unknown, unknown>, T, Full> = {
       : never;
 };
 
+export const STOIC_INTERNAL = Symbol("stoic.internal");
+
+export interface StoicBatchControls {
+  begin(): void;
+  end(): void;
+}
+
+export interface StoicInternals {
+  batch: StoicBatchControls;
+}
+
 export type StoicStore<T, Full = T> = {
   getState: () => Full;
   setState: SetState<T, Full>;
   subscribe: (listener: Listener<Full>) => () => void;
   actions<M extends ActionMap<T, Full>>(map: M): ActionHandlesFor<M, T, Full>;
   destroy: () => void;
+  // Not part of the public API: internal escape hatches for stoic-store's own
+  // tools/plugins (e.g. `batch()`) without every consumer seeing them.
+  [STOIC_INTERNAL]: StoicInternals;
 };
 
 export type ActionContext<Full = unknown> = {
@@ -130,6 +144,11 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   // Raw keys changed since the last flush while unobserved; null = nothing pending.
   let pendingDirty: Set<string> | null = null;
+
+  // >0 while a `batch()` call (from stoic-store/tools) is in progress. Setting
+  // this makes setState/getState behave as if the store were unobserved, so
+  // recompute and notification only happen once the outermost batch ends.
+  let batchDepth = 0;
 
   const recomputeDerived = (dirty: Set<string> | null) => {
     let recomputedAny = false;
@@ -180,8 +199,23 @@ function internal__createStore<T extends object, D extends object = Record<never
   };
 
   const getState = () => {
-    flush();
+    if (batchDepth === 0) flush();
     return state;
+  };
+
+  const beginBatch = () => {
+    batchDepth++;
+  };
+
+  const endBatch = () => {
+    batchDepth--;
+    if (batchDepth > 0 || !isObserved()) return;
+
+    flush();
+    runHooks("afterSetState", state);
+    listeners.forEach((l) => {
+      l(state);
+    });
   };
 
   const setState: SetState<T, Full> = (partial) => {
@@ -204,7 +238,7 @@ function internal__createStore<T extends object, D extends object = Record<never
       }
     }
 
-    if (isObserved()) {
+    if (batchDepth === 0 && isObserved()) {
       if (pendingDirty !== null) {
         for (const k of pendingDirty) dirty.add(k);
         pendingDirty = null;
@@ -302,7 +336,14 @@ function internal__createStore<T extends object, D extends object = Record<never
     listeners.clear();
   };
 
-  const store = { getState, setState, subscribe, actions, destroy };
+  const store = {
+    getState,
+    setState,
+    subscribe,
+    actions,
+    destroy,
+    [STOIC_INTERNAL]: { batch: { begin: beginBatch, end: endBatch } },
+  };
 
   runHooks("onInit", store);
 
@@ -390,5 +431,6 @@ export function createStore<T extends object, D extends object = Record<never, n
     subscribe: store.subscribe,
     actions,
     destroy: store.destroy,
+    [STOIC_INTERNAL]: store[STOIC_INTERNAL],
   };
 }

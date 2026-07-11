@@ -21,6 +21,7 @@ No reducers • No dependency arrays • No boilerplate • Fully typed • Plug
 <a href="#quick-start">Quick Start</a> •
 <a href="#core-concepts">Core Concepts</a> •
 <a href="#derived-state">Derived State</a> •
+<a href="#batching">Batching</a> •
 <a href="#plugins">Plugins</a> •
 <a href="#faq">FAQ</a>
 </p>
@@ -309,6 +310,46 @@ There are no dependency arrays to maintain and nothing to memoize by hand — St
 
 ---
 
+## Batching
+
+Every `setState` call — whether direct or made from inside an action — recomputes derived state and notifies components immediately. Calling three actions in a row means three recomputes and three rerenders. Wrap them in `batch`, from `stoic-store/tools`, to coalesce all of it into a single recompute and a single rerender:
+
+```tsx
+import { batch } from "stoic-store/tools";
+
+const store = createStore({
+  state: { name: "", age: 0, country: "" },
+});
+
+const { setName, setAge, setCountry } = store.actions({
+  setName: (setState, name: string) => setState({ name }),
+  setAge: (setState, age: number) => setState({ age }),
+  setCountry: (setState, country: string) => setState({ country }),
+});
+
+batch(store, () => {
+  setName("John");
+  setAge(30);
+  setCountry("USA");
+});
+```
+
+`batch` also works with async actions — pass an async function and `await` the result:
+
+```tsx
+await batch(store, async () => {
+  await loadUser();
+  await loadPosts();
+  await loadSettings();
+});
+```
+
+Everything called inside the callback — direct `setState` calls, actions, or both — is deferred until the batch closes, whether the callback is sync or async. If it throws or its returned promise rejects, pending changes are still flushed and listeners still notified once before the error propagates.
+
+> Reads made *during* a batch (e.g. `store.getState()` from inside another action) see up-to-date raw state but stale derived values — derived state only recomputes once the batch closes. This mirrors how React itself batches `setState` calls.
+
+---
+
 ## Plugins
 
 The core of Stoic only handles state, derived state, and actions. Everything else — persistence, logging, devtools — is a plugin, so you only pay for what you use.
@@ -388,7 +429,7 @@ A plugin is an object implementing any of the `StoicPlugin` lifecycle hooks. Hoo
 
 * `onInit(store)` — called once when the store is created.
 * `beforeAction(ctx)` / `afterAction(ctx)` — called around every action call, with `{ name, args, state }`. `afterAction` still runs if the action throws or rejects.
-* `beforeSetState(partial)` / `afterSetState(state)` — called around every `setState`, with the raw partial update and the full merged state respectively.
+* `beforeSetState(partial)` / `afterSetState(state)` — called around every `setState`, with the raw partial update and the full merged state respectively. During a [`batch`](#batching), `afterSetState` fires once when the batch closes rather than once per `setState` call — so `persist` writes once and `devtools` logs one combined entry per batch.
 * `onDestroy()` — called when `store.destroy()` is called.
 
 ```tsx
