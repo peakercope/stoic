@@ -423,6 +423,14 @@ persist({
 });
 ```
 
+#### Derived state is never persisted
+
+[Derived values](#derived-state) are recomputed from your raw state on every load, so `persist` never writes them, and ignores any it finds in stored data when rehydrating. You don't need to list them in `exclude` — naming one in `include` throws, since the request can't be honored.
+
+This matters when a derived function changes. If old derived values were restored from storage, they would only be recomputed once one of their dependencies changed — so a user whose raw state hadn't moved would keep seeing values computed by the *previous* version of your code. Recomputing on load avoids that entirely.
+
+If you want a value persisted and *not* recomputed, it isn't derived state — put it in `state`.
+
 ### Writing a plugin
 
 A plugin is an object implementing any of the `StoicPlugin` lifecycle hooks. Hooks only observe state — they can't transform it:

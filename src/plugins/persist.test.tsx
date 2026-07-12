@@ -175,6 +175,119 @@ describe("persist", () => {
     ).toThrow();
   });
 
+  describe("derived", () => {
+    type Counter = { count: number };
+    type CounterDerived = { doubled: number };
+
+    it("does not write derived values to storage", () => {
+      const store = createStore<Counter, CounterDerived>({
+        state: { count: 0 },
+        derived: { doubled: (s) => s.count * 2 },
+        plugins: [persist<Counter>({ key: "derived-write-storage" })],
+      });
+
+      store.setState({ count: 3 });
+
+      expect(JSON.parse(localStorage.getItem("derived-write-storage") as string)).toEqual({
+        count: 3,
+      });
+      store.destroy();
+    });
+
+    it("ignores a stale derived value in stored data on rehydration", () => {
+      localStorage.setItem("derived-stale-storage", JSON.stringify({ count: 0, doubled: 999 }));
+
+      const store = createStore<Counter, CounterDerived>({
+        state: { count: 0 },
+        derived: { doubled: (s) => s.count * 2 },
+        plugins: [persist<Counter>({ key: "derived-stale-storage" })],
+      });
+
+      expect(store.getState().doubled).toBe(0);
+      expect(JSON.parse(localStorage.getItem("derived-stale-storage") as string)).toEqual({
+        count: 0,
+      });
+      store.destroy();
+    });
+
+    it("recomputes with the current formula when a derived function has changed", () => {
+      // Written by an older release whose `doubled` was `count * 2`.
+      localStorage.setItem("derived-formula-storage", JSON.stringify({ count: 5, doubled: 10 }));
+
+      const store = createStore<Counter, CounterDerived>({
+        state: { count: 0 },
+        derived: { doubled: (s) => s.count * 3 },
+        plugins: [persist<Counter>({ key: "derived-formula-storage" })],
+      });
+
+      expect(store.getState().doubled).toBe(15);
+      store.destroy();
+    });
+
+    it("throws at store creation if include names a derived key", () => {
+      expect(() =>
+        createStore<Counter, CounterDerived>({
+          state: { count: 0 },
+          derived: { doubled: (s) => s.count * 2 },
+          plugins: [
+            persist<Counter>({
+              key: "derived-include-storage",
+              // `include` is typed against raw state, so naming a derived key
+              // takes a cast — the guard is for users who reach for one.
+              include: ["doubled" as keyof Counter],
+            }),
+          ],
+        }),
+      ).toThrow(/doubled/);
+    });
+
+    it("treats a derived key in exclude as a no-op", () => {
+      type Gated = { count: number; loading: boolean };
+
+      const store = createStore<Gated, CounterDerived>({
+        state: { count: 0, loading: false },
+        derived: { doubled: (s) => s.count * 2 },
+        plugins: [
+          persist<Gated>({
+            key: "derived-exclude-storage",
+            exclude: ["loading", "doubled" as keyof Gated],
+          }),
+        ],
+      });
+
+      store.setState({ count: 4 });
+
+      expect(JSON.parse(localStorage.getItem("derived-exclude-storage") as string)).toEqual({
+        count: 4,
+      });
+      store.destroy();
+    });
+
+    it("keeps derived values out of debounced and destroy-flushed writes", () => {
+      vi.useFakeTimers();
+
+      const store = createStore<Counter, CounterDerived>({
+        state: { count: 0 },
+        derived: { doubled: (s) => s.count * 2 },
+        plugins: [
+          persist<Counter>({
+            key: "derived-debounce-storage",
+            debounceMs: 100,
+          }),
+        ],
+      });
+
+      store.setState({ count: 2 });
+      store.destroy();
+
+      expect(JSON.parse(localStorage.getItem("derived-debounce-storage") as string)).toEqual({
+        count: 2,
+      });
+
+      vi.useRealTimers();
+    });
+  });
+
   describe("debounceMs", () => {
     beforeEach(() => {
       vi.useFakeTimers();

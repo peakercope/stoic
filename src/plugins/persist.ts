@@ -1,23 +1,28 @@
-import type { StoicPlugin } from "../stoic";
+import { STOIC_INTERNAL, type StoicPlugin } from "../stoic";
 
+// Derived values are always recomputed from raw state, so they are dropped on
+// the way out (never written) and on the way back in (a persisted derived value
+// is stale by definition, and would survive rehydration untouched whenever its
+// dependencies happen to be unchanged).
 function filterKeys<T extends object>(
   state: T,
   options: { include?: (keyof T)[]; exclude?: (keyof T)[] },
+  derivedKeys: ReadonlySet<string>,
 ): Partial<T> {
+  const result: Partial<T> = {};
+
   if (options.include) {
-    const result: Partial<T> = {};
     for (const key of options.include) result[key] = state[key];
     return result;
   }
-  if (options.exclude) {
-    const excluded = new Set(options.exclude);
-    const result: Partial<T> = {};
-    for (const key of Object.keys(state) as (keyof T)[]) {
-      if (!excluded.has(key)) result[key] = state[key];
-    }
-    return result;
+
+  const excluded = new Set(options.exclude ?? []);
+  for (const key of Object.keys(state) as (keyof T)[]) {
+    if (excluded.has(key)) continue;
+    if (derivedKeys.has(key as string)) continue;
+    result[key] = state[key];
   }
-  return state;
+  return result;
 }
 
 export function persist<T extends object>(options: {
@@ -41,9 +46,12 @@ export function persist<T extends object>(options: {
   const doSerialize = options.serialize ?? JSON.stringify;
   const doDeserialize = options.deserialize ?? (JSON.parse as (raw: string) => Partial<T>);
 
+  // Populated in onInit, before any read or write can happen.
+  let derivedKeys: ReadonlySet<string> = new Set();
+
   const writeToStorage = (state: T) => {
     try {
-      getStorage().setItem(options.key, doSerialize(filterKeys(state, options)));
+      getStorage().setItem(options.key, doSerialize(filterKeys(state, options, derivedKeys)));
     } catch {
       console.warn("Stoic persist plugin: failed to write state to storage");
     }
@@ -57,11 +65,24 @@ export function persist<T extends object>(options: {
 
   return {
     onInit(store) {
+      // Must be set before the rehydrating setState below, which fires
+      // afterSetState and so writes straight back to storage.
+      derivedKeys = new Set(store[STOIC_INTERNAL].derivedKeys);
+
+      for (const key of options.include ?? []) {
+        if (derivedKeys.has(key as string)) {
+          throw new Error(
+            `persist: \`include\` names derived key "${String(key)}". Derived values are ` +
+              "recomputed from state and are never persisted. Move it to `state` to persist it.",
+          );
+        }
+      }
+
       try {
         const raw = getStorage().getItem(options.key);
         if (raw != null) {
           const parsed = doDeserialize(raw);
-          store.setState(filterKeys(parsed as T, options));
+          store.setState(filterKeys(parsed as T, options, derivedKeys));
         }
       } catch {
         console.warn("Stoic persist plugin: failed to read state from storage");

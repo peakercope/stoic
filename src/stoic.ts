@@ -85,6 +85,7 @@ export interface StoicBatchControls {
 
 export interface StoicInternals {
   batch: StoicBatchControls;
+  derivedKeys: readonly string[];
 }
 
 export type StoicStore<T, Full = T> = {
@@ -342,7 +343,7 @@ function internal__createStore<T extends object, D extends object = Record<never
     subscribe,
     actions,
     destroy,
-    [STOIC_INTERNAL]: { batch: { begin: beginBatch, end: endBatch } },
+    [STOIC_INTERNAL]: { batch: { begin: beginBatch, end: endBatch }, derivedKeys },
   };
 
   runHooks("onInit", store);
