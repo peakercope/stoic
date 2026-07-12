@@ -388,4 +388,35 @@ describe("persist", () => {
       expect(localStorage.getItem("throttle-destroy-storage")).toBe(JSON.stringify({ count: 9 }));
     });
   });
+
+  describe("rehydration with mismatched payloads", () => {
+    it("keeps initial defaults for included keys missing from the stored payload", () => {
+      localStorage.setItem("partial-include-storage", JSON.stringify({ theme: "light" }));
+
+      const store = createStore({
+        state: { theme: "dark", fontSize: 14 },
+        plugins: [
+          persist<{ theme: string; fontSize: number }>({
+            key: "partial-include-storage",
+            include: ["theme", "fontSize"],
+          }),
+        ],
+      });
+
+      expect(store.getState()).toEqual({ theme: "light", fontSize: 14 });
+      store.destroy();
+    });
+
+    it("does not merge unknown keys from a stale stored payload into state", () => {
+      localStorage.setItem("stale-keys-storage", JSON.stringify({ theme: "light", legacy: true }));
+
+      const store = createStore({
+        state: { theme: "dark" },
+        plugins: [persist<{ theme: string }>({ key: "stale-keys-storage" })],
+      });
+
+      expect(store.getState()).toEqual({ theme: "light" });
+      store.destroy();
+    });
+  });
 });

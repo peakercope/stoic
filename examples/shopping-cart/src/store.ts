@@ -74,13 +74,9 @@ export const cart = createStore<CartState, CartDerived>({
       discountedSubtotal + shippingCost + taxAmount,
   },
 
-  // Persist the cart so it survives a page reload. `include` stores only the
-  // real state keys — every derived value is recomputed from them on load, so
-  // there's no point writing them to storage.
   plugins: [
     persist<CartState>({
       key: "stoic-cart",
-      include: ["items", "coupon", "shippingMethod", "taxRate"],
       debounceMs: 200,
     }),
   ],

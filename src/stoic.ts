@@ -151,27 +151,47 @@ function internal__createStore<T extends object, D extends object = Record<never
   // recompute and notification only happen once the outermost batch ends.
   let batchDepth = 0;
 
+  const sameDeps = (prev: Set<string> | undefined, next: Set<string>) => {
+    if (prev === undefined || prev.size !== next.size) return false;
+    for (const key of prev) {
+      if (!next.has(key)) return false;
+    }
+    return true;
+  };
+
   const recomputeDerived = (dirty: Set<string> | null) => {
-    let recomputedAny = false;
+    let depsChanged = false;
+    // One proxy per pass; `state` is only reassigned between passes, and the
+    // target must stay the live state object so spread/ownKeys work in
+    // derived functions. `trackedKeys` is swapped per entry.
+    let trackedKeys!: Set<string>;
+    let proxiedState: Full | undefined;
 
     for (const [key, fn] of derivedEntries) {
       const deps = dependencies.get(key);
-      const mustRun = dirty === null || deps === undefined || [...deps].some((d) => dirty.has(d));
+      let mustRun = dirty === null || deps === undefined;
+      if (!mustRun) {
+        for (const d of deps as Set<string>) {
+          if ((dirty as Set<string>).has(d)) {
+            mustRun = true;
+            break;
+          }
+        }
+      }
 
       if (!mustRun) continue;
 
-      recomputedAny = true;
-
-      const trackedKeys = new Set<string>();
-      const proxiedState = new Proxy(state, {
+      proxiedState ??= new Proxy(state, {
         get(target, prop, receiver) {
           if (typeof prop === "string") trackedKeys.add(prop);
           return Reflect.get(target, prop, receiver);
         },
       });
+      trackedKeys = new Set<string>();
 
       const prevValue = (state as Record<string, unknown>)[key];
       const newValue = fn(proxiedState);
+      if (!depsChanged && !sameDeps(deps, trackedKeys)) depsChanged = true;
       dependencies.set(key, trackedKeys);
 
       (state as Record<string, unknown>)[key] = newValue;
@@ -181,7 +201,9 @@ function internal__createStore<T extends object, D extends object = Record<never
       }
     }
 
-    if (recomputedAny) {
+    // A cycle can only appear when some dependency set actually changed, so
+    // the DFS is skipped for steady-state recomputation.
+    if (depsChanged) {
       const cycle = findDerivedDependencyCycle(derivedKeys, dependencies);
       if (cycle) throw new CircularDependencyError(cycle);
     }
@@ -196,7 +218,21 @@ function internal__createStore<T extends object, D extends object = Record<never
     if (pendingDirty === null) return;
     const dirty = pendingDirty;
     pendingDirty = null;
-    recomputeDerived(dirty);
+    try {
+      recomputeDerived(dirty);
+    } catch (err) {
+      // Re-stash so a later flush retries: recomputation is idempotent, and
+      // dropping the dirty set would leave dependents stale forever.
+      pendingDirty = dirty;
+      throw err;
+    }
+  };
+
+  const notify = () => {
+    runHooks("afterSetState", state);
+    listeners.forEach((l) => {
+      l(state);
+    });
   };
 
   const getState = () => {
@@ -210,24 +246,25 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   const endBatch = () => {
     batchDepth--;
-    if (batchDepth > 0 || !isObserved()) return;
+    // pendingDirty is non-null iff some setState ran while deferred; a batch
+    // that never wrote has nothing to recompute or announce.
+    if (batchDepth > 0 || !isObserved() || pendingDirty === null) return;
 
     flush();
-    runHooks("afterSetState", state);
-    listeners.forEach((l) => {
-      l(state);
-    });
+    notify();
   };
 
   const setState: SetState<T, Full> = (partial) => {
-    const prevState = state;
-    const next = typeof partial === "function" ? partial(state) : partial;
+    // getState (not the raw variable) so the functional form sees flushed
+    // derived values even when recomputation was deferred while unobserved.
+    const next = typeof partial === "function" ? partial(getState()) : partial;
 
     runHooks("beforeSetState", next);
 
+    const prevState = state;
     state = { ...state, ...next };
 
-    const dirty = new Set<string>();
+    if (pendingDirty === null) pendingDirty = new Set();
     for (const key of Object.keys(next)) {
       if (
         !Object.is(
@@ -235,26 +272,13 @@ function internal__createStore<T extends object, D extends object = Record<never
           (state as Record<string, unknown>)[key],
         )
       ) {
-        dirty.add(key);
+        pendingDirty.add(key);
       }
     }
 
     if (batchDepth === 0 && isObserved()) {
-      if (pendingDirty !== null) {
-        for (const k of pendingDirty) dirty.add(k);
-        pendingDirty = null;
-      }
-
-      recomputeDerived(dirty);
-
-      runHooks("afterSetState", state);
-
-      listeners.forEach((l) => {
-        l(state);
-      });
-    } else {
-      if (pendingDirty === null) pendingDirty = new Set();
-      for (const k of dirty) pendingDirty.add(k);
+      flush();
+      notify();
     }
   };
 
@@ -267,6 +291,9 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   const createActionRunner = (name: string, fn: (...args: unknown[]) => unknown) => {
     let meta: ActionMeta = { status: "idle", error: undefined };
+    // Overlapping calls: stay "pending" until the last one settles, then
+    // report that settle's outcome.
+    let inflight = 0;
     const metaListeners = new Set<(meta: ActionMeta) => void>();
 
     const setMeta = (next: ActionMeta) => {
@@ -285,33 +312,35 @@ function internal__createStore<T extends object, D extends object = Record<never
         runHooks("afterAction", { name, args, state: getState() });
       };
 
+      inflight++;
       setMeta({ status: "pending", error: undefined });
+
+      const settle = (outcome: ActionMeta) => {
+        finish();
+        if (--inflight === 0) setMeta(outcome);
+      };
 
       let result: unknown;
       try {
         result = fn(setState, ...args);
       } catch (err) {
-        finish();
-        setMeta({ status: "error", error: err });
+        settle({ status: "error", error: err });
         throw err;
       }
 
       if (result instanceof Promise) {
         return result.then(
           (value) => {
-            finish();
-            setMeta({ status: "success", error: undefined });
+            settle({ status: "success", error: undefined });
             return value;
           },
           (err) => {
-            finish();
-            setMeta({ status: "error", error: err });
+            settle({ status: "error", error: err });
             throw err;
           },
         );
       }
-      finish();
-      setMeta({ status: "success", error: undefined });
+      settle({ status: "success", error: undefined });
       return result;
     };
 
@@ -350,6 +379,8 @@ function internal__createStore<T extends object, D extends object = Record<never
 
   return store;
 }
+
+const UNSET = Symbol("stoic.unset");
 
 type UseStore<Full> = <U = Full>(
   selector?: (state: Full) => U,
@@ -396,7 +427,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     selector: (state: Full) => U = (s) => s as unknown as U,
     equality: (a: U, b: U) => boolean = Object.is,
   ) {
-    const selectedRef = useRef<U>(selector(store.getState()));
+    // Sentinel-gated so the selector doesn't run on every render just to
+    // produce a discarded useRef initializer.
+    const selectedRef = useRef<U | typeof UNSET>(UNSET);
+    if (selectedRef.current === UNSET) selectedRef.current = selector(store.getState());
 
     // React calls the snapshot functions repeatedly and compares the results with
     // `Object.is`, so an object-literal selector must return the *same* reference
@@ -406,11 +440,11 @@ export function createStore<T extends object, D extends object = Record<never, n
     const read = () => {
       const next = selector(store.getState());
 
-      if (!equality(selectedRef.current, next)) {
+      if (!equality(selectedRef.current as U, next)) {
         selectedRef.current = next;
       }
 
-      return selectedRef.current;
+      return selectedRef.current as U;
     };
 
     return useSyncExternalStore(store.subscribe, read, read);

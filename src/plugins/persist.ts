@@ -12,7 +12,11 @@ function filterKeys<T extends object>(
   const result: Partial<T> = {};
 
   if (options.include) {
-    for (const key of options.include) result[key] = state[key];
+    // A key can be absent when rehydrating an older payload that predates it;
+    // copying it anyway would overwrite the initial-state default with undefined.
+    for (const key of options.include) {
+      if (key in state) result[key] = state[key];
+    }
     return result;
   }
 
@@ -81,8 +85,14 @@ export function persist<T extends object>(options: {
       try {
         const raw = getStorage().getItem(options.key);
         if (raw != null) {
-          const parsed = doDeserialize(raw);
-          store.setState(filterKeys(parsed as T, options, derivedKeys));
+          const parsed = filterKeys(doDeserialize(raw) as T, options, derivedKeys);
+          // Drop keys the store no longer has: a stale payload would otherwise
+          // merge them into state and re-persist them forever.
+          const current = store.getState();
+          for (const key of Object.keys(parsed) as (keyof T)[]) {
+            if (!(key in current)) delete parsed[key];
+          }
+          store.setState(parsed);
         }
       } catch {
         console.warn("Stoic persist plugin: failed to read state from storage");

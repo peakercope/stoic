@@ -50,9 +50,12 @@ export function devtools<T extends object, Full extends object = T>(
 
   const setStateFromDevtools = (state: Full) => {
     if (!store) return;
+    const wasRecording = isRecording;
     isRecording = false;
     store.setState(state);
-    isRecording = true;
+    // Restore rather than force `true`: a jump while recording is paused
+    // must not silently re-enable recording.
+    isRecording = wasRecording;
   };
 
   return {

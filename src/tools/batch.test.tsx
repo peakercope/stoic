@@ -154,4 +154,15 @@ describe("batch", () => {
     expect(store.getState().doubled).toBe(10);
     store.destroy();
   });
+
+  it("does not notify listeners when the batch performed no setState", () => {
+    const store = createStore({ state: { count: 0 } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    batch(store, () => {});
+
+    expect(listener).not.toHaveBeenCalled();
+    store.destroy();
+  });
 });

@@ -1134,3 +1134,71 @@ describe("shallow", () => {
     expect(shallow({ a: { x: 1 } }, { a: { x: 1 } })).toBe(false);
   });
 });
+
+describe("regressions", () => {
+  it("action meta stays pending while an overlapping call is still in flight", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    let resolveSecond!: () => void;
+    let call = 0;
+    const { load } = actions({
+      load: async () => {
+        call++;
+        if (call === 1) {
+          await Promise.resolve();
+        } else {
+          await new Promise<void>((resolve) => {
+            resolveSecond = resolve;
+          });
+        }
+      },
+    });
+
+    const first = load();
+    const second = load();
+    await first;
+
+    expect(load.getMeta().status).toBe("pending");
+
+    resolveSecond();
+    await second;
+    expect(load.getMeta().status).toBe("success");
+  });
+
+  it("functional setState sees fresh derived values while unobserved", () => {
+    const { getState, setState } = createStore<
+      { count: number; snapshot: number },
+      { doubled: number }
+    >({
+      state: { count: 1, snapshot: 0 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+
+    // No listeners: derived recomputation is deferred after this write.
+    setState({ count: 5 });
+    setState((s) => ({ snapshot: s.doubled }));
+
+    expect(getState().snapshot).toBe(10);
+  });
+
+  it("recovers derived recomputation after a derived function throws", () => {
+    let shouldThrow = false;
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: {
+        doubled: (s) => {
+          if (shouldThrow) throw new Error("boom");
+          return s.count * 2;
+        },
+      },
+    });
+    const unsubscribe = store.subscribe(() => {});
+
+    shouldThrow = true;
+    expect(() => store.setState({ count: 2 })).toThrow("boom");
+
+    shouldThrow = false;
+    expect(store.getState().doubled).toBe(4);
+    unsubscribe();
+    store.destroy();
+  });
+});
