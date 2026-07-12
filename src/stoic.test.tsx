@@ -1,5 +1,5 @@
 import { act } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -942,6 +942,68 @@ describe("useStore", () => {
     expect(hook.get()).toEqual({ subtotal: 20, total: 12 });
     hook.unmount();
   });
+
+  it("does not re-render children when a change only touches unrelated derived values", () => {
+    // Mirrors the shopping-cart example: a parent selects `items` plus a derived
+    // count, while an unrelated raw key feeds a *different* derived value. The
+    // parent (and therefore its children) must not re-render.
+    const store = createStore<
+      { items: { id: string; quantity: number }[]; shippingMethod: string },
+      { totalItems: number; shippingCost: number }
+    >({
+      state: { items: [{ id: "a", quantity: 2 }], shippingMethod: "standard" },
+      derived: {
+        totalItems: ({ items }) => items.reduce((n, i) => n + i.quantity, 0),
+        shippingCost: ({ shippingMethod }) => (shippingMethod === "express" ? 24.99 : 9.99),
+      },
+    });
+
+    const childRenders = vi.fn();
+
+    function Child({ id }: { id: string }) {
+      childRenders();
+      return <li>{id}</li>;
+    }
+
+    const parentRenders = vi.fn();
+
+    function Parent() {
+      parentRenders();
+      const { items } = store.useStore(
+        (s) => ({ items: s.items, totalItems: s.totalItems }),
+        shallow,
+      );
+      return (
+        <ul>
+          {items.map((i) => (
+            <Child key={i.id} id={i.id} />
+          ))}
+        </ul>
+      );
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<Parent />));
+
+    const parentBefore = parentRenders.mock.calls.length;
+    const childBefore = childRenders.mock.calls.length;
+    const itemsBefore = store.getState().items;
+
+    act(() => {
+      store.setState({ shippingMethod: "express" });
+    });
+
+    // shippingCost recomputed, but items/totalItems untouched → nothing re-renders.
+    expect(store.getState().shippingCost).toBe(24.99);
+    expect(store.getState().items).toBe(itemsBefore);
+    expect(parentRenders.mock.calls.length).toBe(parentBefore);
+    expect(childRenders.mock.calls.length).toBe(childBefore);
+
+    act(() => root.unmount());
+    container.remove();
+  });
 });
 
 describe("useStore SSR", () => {
@@ -955,6 +1017,43 @@ describe("useStore SSR", () => {
 
     const html = renderToString(<Component />);
     expect(html).toContain("42");
+  });
+
+  it("caches the server snapshot so object-literal selectors can hydrate", () => {
+    const store = createStore({ state: { count: 42, label: "server", other: 0 } });
+
+    function Component() {
+      const { count, label } = store.useStore((s) => ({ count: s.count, label: s.label }), shallow);
+      return (
+        <div>
+          {count}
+          {label}
+        </div>
+      );
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    container.innerHTML = renderToString(<Component />);
+
+    // An uncached getServerSnapshot returns a fresh object on every call, which
+    // React detects during hydration ("The result of getServerSnapshot should be
+    // cached to avoid an infinite loop").
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    let root!: ReturnType<typeof hydrateRoot>;
+    act(() => {
+      root = hydrateRoot(container, <Component />);
+    });
+
+    const messages = errors.mock.calls.map((c) => String(c[0])).join("\n");
+    errors.mockRestore();
+
+    expect(messages).not.toContain("getServerSnapshot should be cached");
+    expect(container.textContent).toContain("42");
+
+    act(() => root.unmount());
+    container.remove();
   });
 });
 

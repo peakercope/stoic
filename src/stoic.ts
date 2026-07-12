@@ -396,19 +396,23 @@ export function createStore<T extends object, D extends object = Record<never, n
     equality: (a: U, b: U) => boolean = Object.is,
   ) {
     const selectedRef = useRef<U>(selector(store.getState()));
-    return useSyncExternalStore(
-      store.subscribe,
-      () => {
-        const next = selector(store.getState());
 
-        if (!equality(selectedRef.current, next)) {
-          selectedRef.current = next;
-        }
+    // React calls the snapshot functions repeatedly and compares the results with
+    // `Object.is`, so an object-literal selector must return the *same* reference
+    // until the selection actually changes. This applies to the server snapshot
+    // too: returning a fresh object there makes React bail out with "The result of
+    // getServerSnapshot should be cached to avoid an infinite loop" on hydration.
+    const read = () => {
+      const next = selector(store.getState());
 
-        return selectedRef.current;
-      },
-      () => selector(store.getState()),
-    );
+      if (!equality(selectedRef.current, next)) {
+        selectedRef.current = next;
+      }
+
+      return selectedRef.current;
+    };
+
+    return useSyncExternalStore(store.subscribe, read, read);
   }
 
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
