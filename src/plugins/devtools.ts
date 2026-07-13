@@ -21,7 +21,7 @@ type DevtoolsMessage = {
 // runtime (https://github.com/reduxjs/redux-devtools/issues/1097).
 type Connection = {
   init: (state: unknown) => void;
-  send: (action: { type: string }, state: unknown) => void;
+  send: (action: { type: string; args?: readonly unknown[] }, state: unknown) => void;
   subscribe: (listener: (message: DevtoolsMessage) => void) => (() => void) | undefined;
   unsubscribe: () => void;
 };
@@ -123,9 +123,13 @@ export function devtools<T extends object, Full extends object = T>(
         }
       });
     },
-    afterSetState(state, actionName) {
+    afterSetState(state, actionName, actionArgs) {
       if (!isRecording || !connection) return;
-      connection.send({ type: actionName ?? anonymousActionType }, state);
+      const type = actionName ?? anonymousActionType;
+      // Args are sent by reference (like Redux): the extension serializes them
+      // on receipt. `args` is absent — not empty — for a direct `store.setState`,
+      // which has no action and therefore no arguments.
+      connection.send(actionArgs ? { type, args: [...actionArgs] } : { type }, state);
     },
     onDestroy() {
       connection?.unsubscribe();

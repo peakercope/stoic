@@ -74,8 +74,10 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
    * `actionName` is the action whose `ctx.set` produced the change (also
    * across `await`s), or `undefined` for a direct `store.setState`. For a
    * batch it is the action behind the last state-changing write.
+   * `actionArgs` are the arguments that action was invoked with, attributed
+   * the same way; `undefined` for a direct `store.setState`.
    */
-  afterSetState?(state: Full, actionName?: string): void;
+  afterSetState?(state: Full, actionName?: string, actionArgs?: readonly unknown[]): void;
   onDestroy?(): void;
 }
 
@@ -221,7 +223,9 @@ export function createStore<T extends object, D extends object = Record<never, n
   // write is credited to its action even after an `await` or when actions
   // overlap. `batchActionName` carries it across a deferred batch flush.
   let currentActionName: string | undefined;
+  let currentActionArgs: readonly unknown[] | undefined;
   let batchActionName: string | undefined;
+  let batchActionArgs: readonly unknown[] | undefined;
 
   // Guards against a plugin or subscriber calling setState from inside a
   // notification: one level of re-entrancy is legal but warned about (it
@@ -230,7 +234,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   const MAX_NOTIFY_DEPTH = 25;
   let notifyDepth = 0;
 
-  const notify = (actionName?: string) => {
+  const notify = (actionName?: string, actionArgs?: readonly unknown[]) => {
     if (notifyDepth > 0) {
       warn(
         "stoic: re-entrant setState detected — a plugin or subscriber updated state while a " +
@@ -245,7 +249,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     notifyDepth++;
     try {
-      runHooks("afterSetState", snapshot, actionName);
+      runHooks("afterSetState", snapshot, actionName, actionArgs);
       listeners.forEach((l) => {
         l(snapshot);
       });
@@ -281,9 +285,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     if (batchDepth > 0) {
       batchChanged = true;
       batchActionName = currentActionName;
+      batchActionArgs = currentActionArgs;
       return;
     }
-    notify(currentActionName);
+    notify(currentActionName, currentActionArgs);
   };
 
   const batch = <R>(fn: () => R): R => {
@@ -294,8 +299,10 @@ export function createStore<T extends object, D extends object = Record<never, n
       if (--batchDepth === 0 && batchChanged) {
         batchChanged = false;
         const actionName = batchActionName;
+        const actionArgs = batchActionArgs;
         batchActionName = undefined;
-        notify(actionName);
+        batchActionArgs = undefined;
+        notify(actionName, actionArgs);
       }
     }
   };
@@ -340,12 +347,15 @@ export function createStore<T extends object, D extends object = Record<never, n
       // through this action's `set` are credited to it, and the credit
       // survives `await`s and overlapping actions.
       const set: SetState<T, Full> = (partial) => {
-        const prev = currentActionName;
+        const prevName = currentActionName;
+        const prevArgs = currentActionArgs;
         currentActionName = name;
+        currentActionArgs = args;
         try {
           setState(partial);
         } finally {
-          currentActionName = prev;
+          currentActionName = prevName;
+          currentActionArgs = prevArgs;
         }
       };
 

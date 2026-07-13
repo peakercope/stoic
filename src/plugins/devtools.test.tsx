@@ -73,7 +73,73 @@ describe("devtools", () => {
 
     actions.increment();
 
-    expect(extension.send).toHaveBeenCalledWith({ type: "increment" }, { count: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "increment", args: [] }, { count: 1 });
+    store.destroy();
+  });
+
+  it("sends the arguments an action was invoked with", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { items: [] as { id: string; qty: number }[] },
+      plugins: [devtools<{ items: { id: string; qty: number }[] }>({})],
+    });
+
+    const { addItem } = store.actions({
+      addItem: ({ set }, id: string, qty: number) => {
+        set((s) => ({ items: [...s.items, { id, qty }] }));
+      },
+    });
+
+    addItem("a1", 2);
+
+    expect(extension.send).toHaveBeenCalledWith(
+      { type: "addItem", args: ["a1", 2] },
+      { items: [{ id: "a1", qty: 2 }] },
+    );
+    store.destroy();
+  });
+
+  it("sends object arguments as-is", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [devtools<{ count: number }>({})],
+    });
+
+    const { addAll } = store.actions({
+      addAll: ({ set }, amounts: number[]) => {
+        set((s) => ({ count: s.count + amounts.reduce((a, b) => a + b, 0) }));
+      },
+    });
+
+    addAll([1, 2]);
+
+    expect(extension.send).toHaveBeenCalledWith({ type: "addAll", args: [[1, 2]] }, { count: 3 });
+    store.destroy();
+  });
+
+  it("sends one entry per batch, carrying the args of the last state-changing write", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { a: 0, b: 0 },
+      plugins: [devtools<{ a: number; b: number }>({})],
+    });
+
+    const { setA, setB } = store.actions({
+      setA: ({ set }, a: number) => set({ a }),
+      setB: ({ set }, b: number) => set({ b }),
+    });
+
+    store.batch(() => {
+      setA(1);
+      setB(2);
+    });
+
+    expect(extension.send).toHaveBeenCalledTimes(1);
+    expect(extension.send).toHaveBeenCalledWith({ type: "setB", args: [2] }, { a: 1, b: 2 });
     store.destroy();
   });
 
@@ -104,22 +170,22 @@ describe("devtools", () => {
       release = resolve;
     });
     const { slow, fast } = store.actions({
-      slow: async ({ set }) => {
+      slow: async ({ set }, a: number) => {
         await gate;
-        set({ a: 1 });
+        set({ a });
       },
-      fast: async ({ set }) => {
-        set({ b: 1 });
+      fast: async ({ set }, b: number) => {
+        set({ b });
       },
     });
 
-    const slowPromise = slow();
-    await fast();
+    const slowPromise = slow(1);
+    await fast(1);
     release();
     await slowPromise;
 
-    expect(extension.send).toHaveBeenCalledWith({ type: "fast" }, { a: 0, b: 1 });
-    expect(extension.send).toHaveBeenCalledWith({ type: "slow" }, { a: 1, b: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "fast", args: [1] }, { a: 0, b: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "slow", args: [1] }, { a: 1, b: 1 });
     store.destroy();
   });
 
@@ -148,7 +214,7 @@ describe("devtools", () => {
     await slowPromise;
 
     expect(extension.send).toHaveBeenCalledWith({ type: "anonymous" }, { a: 0, b: 1 });
-    expect(extension.send).toHaveBeenCalledWith({ type: "slow" }, { a: 1, b: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "slow", args: [] }, { a: 1, b: 1 });
     store.destroy();
   });
 
@@ -243,7 +309,7 @@ describe("devtools", () => {
     expect(JSON.parse(localStorage.getItem("composed-storage") as string)).toEqual({ count: 1 });
     expect(extension.send).toHaveBeenCalledTimes(1);
     expect(extension.send).toHaveBeenCalledWith(
-      { type: "inc" },
+      { type: "inc", args: [] },
       expect.objectContaining({ count: 1 }),
     );
     expect(store.getState().doubled).toBe(2);

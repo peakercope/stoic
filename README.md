@@ -410,7 +410,14 @@ const cart = createStore({
 });
 ```
 
-Every entry in the DevTools log is tagged with the name of the action that produced it (`setTax`, `addItem`, ...); a `setState` call made outside of an action shows up as `"anonymous"`. Time-travel (jumping to a past state, resetting, importing a state) is applied back to the store automatically. `devtools` accepts:
+Every entry in the DevTools log is tagged with the name of the action that produced it (`setTax`, `addItem`, ...) and carries the arguments that action was called with, under `args`:
+
+```jsonc
+// addItem("a1", 2)
+{ "type": "addItem", "args": ["a1", 2] }
+```
+
+`args` is always an array, so a no-argument action sends `[]`. A `setState` call made outside of an action shows up as `"anonymous"` with no `args` — there's no action, so there are no arguments. Arguments are sent as-is: the extension serializes them on receipt, so unserializable values (DOM events, class instances) are rendered as best it can. Time-travel (jumping to a past state, resetting, importing a state) is applied back to the store automatically. `devtools` accepts:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -498,7 +505,7 @@ A plugin is an object implementing any of the `StoicPlugin` lifecycle hooks. Hoo
 
 * `onInit(store)` — called once when the store is created.
 * `beforeAction(ctx)` / `afterAction(ctx)` — called around every action call, with `{ name, args, state }`. `afterAction` still runs if the action throws or rejects.
-* `afterSetState(state, actionName?)` — called after every update that changed something, with the full merged state. `actionName` is the name of the action whose `set` produced the change (correct even across `await`s and overlapping async actions), or `undefined` for a direct `store.setState`. During a [`batch`](#batching), the hook fires once when the batch closes — so `persist` writes once and `devtools` logs one combined entry per batch.
+* `afterSetState(state, actionName?, actionArgs?)` — called after every update that changed something, with the full merged state. `actionName` is the name of the action whose `set` produced the change (correct even across `await`s and overlapping async actions) and `actionArgs` are the arguments it was called with; both are `undefined` for a direct `store.setState`. During a [`batch`](#batching), the hook fires once when the batch closes, reporting the action behind the last state-changing write — so `persist` writes once and `devtools` logs one combined entry per batch.
 * `onDestroy()` — called when `store.destroy()` is called.
 
 > Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as derived state instead.

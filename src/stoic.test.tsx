@@ -840,6 +840,28 @@ describe("plugins", () => {
     store.destroy();
   });
 
+  it("calls afterSetState with the args of the action behind the write, and none for a direct setState", () => {
+    const calls: unknown[] = [];
+    const plugin: StoicPlugin<{ count: number }> = {
+      afterSetState(_state, actionName, actionArgs) {
+        calls.push([actionName, actionArgs]);
+      },
+    };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const { inc } = store.actions({
+      inc: ({ set }, by: number) => set((s) => ({ count: s.count + by })),
+    });
+
+    inc(5);
+    store.setState({ count: 99 });
+
+    expect(calls).toEqual([
+      ["inc", [5]],
+      [undefined, undefined],
+    ]);
+    store.destroy();
+  });
+
   it("calls beforeAction/afterAction around a sync action with matching context", () => {
     const calls: unknown[] = [];
     const plugin: StoicPlugin<{ count: number }> = {
