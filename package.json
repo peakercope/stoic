@@ -1,7 +1,7 @@
 {
   "name": "stoic-store",
   "type": "module",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Minimal and powerful React state manager. Tiny, intuitive, and fully TypeScript-ready.",
   "author": "peakercope <peakercope@gmail.com> (https://github.com/peakercope)",
   "license": "MIT",
