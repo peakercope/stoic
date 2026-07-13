@@ -24,14 +24,14 @@
   "exports": {
     ".": "./dist/index.js",
     "./plugins": "./dist/plugins.js",
+    "./react": "./dist/react.js",
     "./tools": "./dist/tools.js",
     "./package.json": "./package.json"
   },
   "types": "./dist/index.d.ts",
   "sideEffects": false,
   "files": [
-    "dist",
-    "!dist/**/*.map"
+    "dist"
   ],
   "publishConfig": {
     "access": "public"

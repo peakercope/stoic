@@ -1,22 +1,23 @@
-import { shallow } from "../../../../src/tools";
+import { useStore } from "stoic-store/react";
+import { shallow } from "stoic-store/tools";
 import { money } from "../format";
 import { cart } from "../store";
 
 export function CartSummary() {
   // One selector pulls the whole derived breakdown. `shallow` keeps the
   // component from rerendering unless one of these computed numbers changes.
-  const { subtotal, discountAmount, discountedSubtotal, shippingCost, taxAmount, total } =
-    cart.useStore(
-      (s) => ({
-        subtotal: s.subtotal,
-        discountAmount: s.discountAmount,
-        discountedSubtotal: s.discountedSubtotal,
-        shippingCost: s.shippingCost,
-        taxAmount: s.taxAmount,
-        total: s.total,
-      }),
-      shallow,
-    );
+  const { subtotal, discountAmount, discountedSubtotal, shippingCost, taxAmount, total } = useStore(
+    cart,
+    (s) => ({
+      subtotal: s.subtotal,
+      discountAmount: s.discountAmount,
+      discountedSubtotal: s.discountedSubtotal,
+      shippingCost: s.shippingCost,
+      taxAmount: s.taxAmount,
+      total: s.total,
+    }),
+    shallow,
+  );
 
   return (
     <div className="summary">

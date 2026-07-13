@@ -1,10 +1,10 @@
-export { createStoreContext } from "./context";
 export type {
   ActionContext,
   ActionCtx,
   ActionHandle,
   ActionMeta,
   ActionStatus,
+  Listener,
   SetState,
   StoicPlugin,
   StoicStore,

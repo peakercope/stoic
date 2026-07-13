@@ -1,6 +1,6 @@
-import { useRef, useSyncExternalStore } from "react";
+import { isDevEnv } from "./env";
 
-type Listener<T> = (state: T) => void;
+export type Listener<T> = (state: T) => void;
 
 type DerivedConfig<T, D> = {
   [K in keyof D]: (state: T & D) => D[K];
@@ -20,8 +20,7 @@ export class CircularDependencyError extends Error {
 }
 
 const warn = (message: string) => {
-  const nodeProcess = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process;
-  if (nodeProcess?.env?.NODE_ENV !== "production") console.warn(message);
+  if (isDevEnv()) console.warn(message);
 };
 
 /**
@@ -52,15 +51,14 @@ export type ActionMeta = { status: ActionStatus; error: unknown };
 /**
  * A callable action, as returned by `store.actions`. Call it like the
  * function it wraps (minus the context argument); the extra members expose
- * its {@link ActionMeta} status.
+ * its {@link ActionMeta} status. In React, read it with `useActionMeta`
+ * from `stoic-store/react`.
  */
 export type ActionHandle<A extends unknown[], R> = ((...args: A) => R) & {
   /** The meta of the most recent invocation. */
   getMeta: () => ActionMeta;
   /** Subscribes to meta changes; returns an unsubscribe function. */
   subscribeMeta: (listener: (meta: ActionMeta) => void) => () => void;
-  /** React hook: subscribes the component to this action's meta. */
-  useMeta: () => ActionMeta;
 };
 
 // biome-ignore lint/suspicious/noExplicitAny: args are inferred per entry; any is the only sound constraint for heterogeneous tuples
@@ -99,15 +97,6 @@ export type StoicStore<T, Full = T> = {
    * `setState` and `subscribe` are ignored (with a dev warning).
    */
   destroy: () => void;
-  /**
-   * React hook: subscribes the component to the store. Without arguments it
-   * returns the full state (re-rendering on every change); with a `selector`
-   * only changes to the selected value re-render, compared by `equality`
-   * (default `Object.is` — pass `shallow` from `stoic-store/tools` for
-   * object-literal selectors). Detachable: `const useCart = cart.useStore`
-   * gives lint-friendly identifier-style hooks.
-   */
-  useStore: <U = Full>(selector?: (state: Full) => U, equality?: (a: U, b: U) => boolean) => U;
 };
 
 /** What `beforeAction`/`afterAction` hooks receive about the running action. */
@@ -145,8 +134,6 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
   /** Called when `store.destroy()` runs. */
   onDestroy?(): void;
 }
-
-const UNSET = Symbol("stoic.unset");
 
 // One memoization cell per derived key, shared across snapshots. `deps` records
 // (key, value-at-compute-time) pairs from the most recent compute; that compute
@@ -192,6 +179,14 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const derivedFns = (config.derived ?? {}) as Record<string, (s: Full) => unknown>;
   const derivedKeys = Object.keys(derivedFns);
+  for (const key of derivedKeys) {
+    if (Object.hasOwn(config.state, key)) {
+      throw new Error(
+        `stoic: "${key}" is declared in both \`state\` and \`derived\`. The derived getter ` +
+          "would shadow the state key, making it unreachable and unwritable — rename one of them.",
+      );
+    }
+  }
   const plugins = config.plugins ?? [];
   const listeners = new Set<Listener<Full>>();
 
@@ -470,15 +465,22 @@ export function createStore<T extends object, D extends object = Record<never, n
       metaListeners.add(listener);
       return () => metaListeners.delete(listener);
     };
-    runner.useMeta = () =>
-      useSyncExternalStore(runner.subscribeMeta, runner.getMeta, runner.getMeta);
 
     return runner;
   };
 
+  const registeredActionNames = new Set<string>();
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
     const result: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(map)) {
+      if (registeredActionNames.has(name)) {
+        warn(
+          `stoic: action "${name}" is already registered on this store. Each actions() call ` +
+            "builds new handles with fresh, independent status meta — create handles once " +
+            "(at module or factory level) and reuse them.",
+        );
+      }
+      registeredActionNames.add(name);
       result[name] = createActionRunner(name, fn);
     }
     return result;
@@ -491,35 +493,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     listeners.clear();
   };
 
-  function useStore<U = Full>(
-    selector: (state: Full) => U = (s) => s as unknown as U,
-    equality: (a: U, b: U) => boolean = Object.is,
-  ) {
-    // Sentinel-gated so the selector doesn't run on every render just to
-    // produce a discarded useRef initializer.
-    const selectedRef = useRef<U | typeof UNSET>(UNSET);
-    if (selectedRef.current === UNSET) selectedRef.current = selector(snapshot);
-
-    // React calls the snapshot functions repeatedly and compares the results with
-    // `Object.is`, so an object-literal selector must return the *same* reference
-    // until the selection actually changes. This applies to the server snapshot
-    // too: returning a fresh object there makes React bail out with "The result of
-    // getServerSnapshot should be cached to avoid an infinite loop" on hydration.
-    const read = () => {
-      const next = selector(snapshot);
-
-      if (!equality(selectedRef.current as U, next)) {
-        selectedRef.current = next;
-      }
-
-      return selectedRef.current as U;
-    };
-
-    return useSyncExternalStore(subscribe, read, read);
-  }
-
   const store: StoicStore<T, Full> = {
-    useStore,
     getState,
     setState,
     subscribe,

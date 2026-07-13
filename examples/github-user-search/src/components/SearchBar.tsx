@@ -1,9 +1,10 @@
 import { type FormEvent, useState } from "react";
+import { useActionMeta } from "stoic-store/react";
 import { findUsers } from "../store";
 
 export function SearchBar() {
   const [query, setQuery] = useState("");
-  const { status, error } = findUsers.useMeta();
+  const { status, error } = useActionMeta(findUsers);
 
   function onSubmit(event: FormEvent) {
     event.preventDefault();

@@ -350,4 +350,62 @@ describe("devtools", () => {
     expect(() => store.setState({ count: 1 })).not.toThrow();
     store.destroy();
   });
+
+  it("does not connect by default in production builds, even with the extension present", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [devtools<{ count: number }>({ name: "prod-default" })],
+    });
+    store.setState({ count: 1 });
+
+    expect(extension.connect).not.toHaveBeenCalled();
+    expect(extension.send).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+    store.destroy();
+  });
+
+  it("still connects in production when enabled is passed explicitly", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [devtools<{ count: number }>({ name: "prod-explicit", enabled: true })],
+    });
+
+    expect(extension.connect).toHaveBeenCalledWith({ name: "prod-explicit" });
+    vi.unstubAllEnvs();
+    store.destroy();
+  });
+
+  it("a time-travel jump is written to storage by a persist plugin on the same store", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [
+        devtools<{ count: number }>({ name: "jump-persist" }),
+        persist<{ count: number }>({ key: "jump-persist-storage" }),
+      ],
+    });
+    store.setState({ count: 5 });
+
+    extension.emit({
+      type: "DISPATCH",
+      payload: { type: "JUMP_TO_STATE" },
+      state: JSON.stringify({ count: 2 }),
+    });
+
+    // Documented behavior: a jump goes through setState, so persist observes
+    // it like any other write — storage now holds the jumped-to state.
+    expect(store.getState().count).toBe(2);
+    expect(JSON.parse(localStorage.getItem("jump-persist-storage") as string)).toEqual({
+      count: 2,
+    });
+    localStorage.removeItem("jump-persist-storage");
+    store.destroy();
+  });
 });

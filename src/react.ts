@@ -4,9 +4,66 @@ import {
   type ReactNode,
   useContext,
   useEffect,
+  useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
-import type { StoicStore } from "./stoic";
+import type { ActionMeta, StoicStore } from "./stoic";
+
+const UNSET = Symbol("stoic.unset");
+
+/** The part of a store `useStore` reads; any `StoicStore` satisfies it. */
+type ReadableStore<Full> = {
+  getState: () => Full;
+  subscribe: (listener: (state: Full) => void) => () => void;
+};
+
+/**
+ * React hook: subscribes the component to `store`. Without a selector it
+ * returns the full state (re-rendering on every change); with a `selector`
+ * only changes to the selected value re-render, compared by `equality`
+ * (default `Object.is` — pass `shallow` from `stoic-store/tools` for
+ * object-literal selectors).
+ */
+export function useStore<Full extends object, U = Full>(
+  store: ReadableStore<Full>,
+  selector: (state: Full) => U = (s) => s as unknown as U,
+  equality: (a: U, b: U) => boolean = Object.is,
+): U {
+  // Sentinel-gated so the selector doesn't run on every render just to
+  // produce a discarded useRef initializer.
+  const selectedRef = useRef<U | typeof UNSET>(UNSET);
+  if (selectedRef.current === UNSET) selectedRef.current = selector(store.getState());
+
+  // React calls the snapshot functions repeatedly and compares the results with
+  // `Object.is`, so an object-literal selector must return the *same* reference
+  // until the selection actually changes. This applies to the server snapshot
+  // too: returning a fresh object there makes React bail out with "The result of
+  // getServerSnapshot should be cached to avoid an infinite loop" on hydration.
+  const read = () => {
+    const next = selector(store.getState());
+
+    if (!equality(selectedRef.current as U, next)) {
+      selectedRef.current = next;
+    }
+
+    return selectedRef.current as U;
+  };
+
+  return useSyncExternalStore(store.subscribe, read, read);
+}
+
+/**
+ * React hook: subscribes the component to an action handle's {@link ActionMeta}
+ * status — `useActionMeta(loadUser).status` is `"pending"` while the newest
+ * call is in flight.
+ */
+export function useActionMeta(action: {
+  getMeta: () => ActionMeta;
+  subscribeMeta: (listener: (meta: ActionMeta) => void) => () => void;
+}): ActionMeta {
+  return useSyncExternalStore(action.subscribeMeta, action.getMeta, action.getMeta);
+}
 
 type Bundle<T extends object, Full extends object, A> = {
   store: StoicStore<T, Full>;
@@ -38,8 +95,8 @@ type ProviderProps<P> = { children?: ReactNode } & (undefined extends P
  *
  * The factory returns both the store and its actions, because action handles
  * close over the store they were created from; building them here binds them
- * to the instance once, keeping their identity — and their `useMeta` status —
- * stable across renders.
+ * to the instance once, keeping their identity — and their `useActionMeta`
+ * status — stable across renders.
  */
 export function createStoreContext<T extends object, Full extends object, A, P = void>(
   factory: (init: P) => Bundle<T, Full, A>,
@@ -106,16 +163,16 @@ export function createStoreContext<T extends object, Full extends object, A, P =
     return createElement(Ctx.Provider, { value: instance }, children);
   }
 
-  function useStore<U = Full>(
+  function useContextStore<U = Full>(
     selector?: (state: Full) => U,
     equality?: (a: U, b: U) => boolean,
   ): U {
-    return useInstance("useStore").store.useStore(selector, equality);
+    return useStore(useInstance("useStore").store, selector, equality);
   }
 
   const useActions = (): A => useInstance("useActions").actions;
 
   const useStoreApi = (): StoicStore<T, Full> => useInstance("useStoreApi").store;
 
-  return { Provider, useStore, useActions, useStoreApi };
+  return { Provider, useStore: useContextStore, useActions, useStoreApi };
 }

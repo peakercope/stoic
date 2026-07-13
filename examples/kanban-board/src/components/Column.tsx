@@ -1,4 +1,5 @@
 import { type DragEvent, useState } from "react";
+import { useStore } from "stoic-store/react";
 import type { Column as ColumnType } from "../data";
 import { board, moveTask } from "../store";
 import { TaskCard } from "./TaskCard";
@@ -6,7 +7,7 @@ import { TaskCard } from "./TaskCard";
 export function Column({ column }: { column: ColumnType }) {
   // Each column subscribes to its own slice of the grouped map, so dragging a
   // task between two columns rerenders only those two.
-  const tasks = board.useStore((s) => s.tasksByColumn[column.id]);
+  const tasks = useStore(board, (s) => s.tasksByColumn[column.id]);
   const [isOver, setIsOver] = useState(false);
 
   function onDrop(event: DragEvent<HTMLElement>) {

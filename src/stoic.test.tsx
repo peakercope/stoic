@@ -4,6 +4,7 @@ import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { CircularDependencyError, createStore, type StoicPlugin } from "../src/stoic";
+import { useActionMeta, useStore } from "./react";
 import { shallow } from "./tools/shallow";
 
 // ─── Core store (no React) ────────────────────────────────────────────────────
@@ -1035,21 +1036,21 @@ function renderHook<T>(fn: () => T): { get: () => T; unmount: () => void } {
 describe("useStore", () => {
   it("returns full state without a selector", () => {
     const store = createStore({ state: { count: 0, label: "hello" } });
-    const hook = renderHook(() => store.useStore());
+    const hook = renderHook(() => useStore(store));
     expect(hook.get()).toEqual({ count: 0, label: "hello" });
     hook.unmount();
   });
 
   it("returns selected slice with a selector", () => {
     const store = createStore({ state: { count: 7, label: "hello" } });
-    const hook = renderHook(() => store.useStore((s) => s.count));
+    const hook = renderHook(() => useStore(store, (s) => s.count));
     expect(hook.get()).toBe(7);
     hook.unmount();
   });
 
   it("updates when selected state changes", () => {
     const store = createStore({ state: { count: 0 } });
-    const hook = renderHook(() => store.useStore((s) => s.count));
+    const hook = renderHook(() => useStore(store, (s) => s.count));
     expect(hook.get()).toBe(0);
 
     act(() => {
@@ -1066,7 +1067,7 @@ describe("useStore", () => {
 
     const hook = renderHook(() => {
       renders();
-      return store.useStore((s) => s.count);
+      return useStore(store, (s) => s.count);
     });
 
     const before = renders.mock.calls.length;
@@ -1086,7 +1087,8 @@ describe("useStore", () => {
 
     const hook = renderHook(() => {
       renders();
-      return store.useStore(
+      return useStore(
+        store,
         (s) => s.items,
         (a, b) => a.length === b.length,
       );
@@ -1113,7 +1115,7 @@ describe("useStore", () => {
 
     const hook = renderHook(() => {
       renders();
-      return store.useStore((s) => ({ subtotal: s.subtotal, total: s.total }), shallow);
+      return useStore(store, (s) => ({ subtotal: s.subtotal, total: s.total }), shallow);
     });
 
     const ref = hook.get();
@@ -1142,7 +1144,7 @@ describe("useStore", () => {
     let latest = 0;
 
     function Component({ which }: { which: "a" | "b" }) {
-      latest = store.useStore((s) => s[which]);
+      latest = useStore(store, (s) => s[which]);
       return null;
     }
 
@@ -1191,7 +1193,8 @@ describe("useStore", () => {
 
     function Parent() {
       parentRenders();
-      const { items } = store.useStore(
+      const { items } = useStore(
+        store,
         (s) => ({ items: s.items, totalItems: s.totalItems }),
         shallow,
       );
@@ -1228,15 +1231,15 @@ describe("useStore", () => {
   });
 });
 
-describe("hook bindings", () => {
-  // `const useCart = cart.useStore` is the documented way to get an
-  // identifier-style hook that eslint-plugin-react-hooks can see. That only
-  // works while the store methods never read `this`.
-  it("useStore works detached from the store object", () => {
+describe("store-bound wrapper hooks", () => {
+  // `const useCart = (sel) => useStore(cart, sel)` is the documented way to
+  // get a store-specific hook. That only works while the store methods never
+  // read `this`, so the store can be closed over and passed by reference.
+  it("a wrapper hook around useStore tracks the store", () => {
     const store = createStore({ state: { count: 7 } });
-    const { useStore } = store;
+    const useCount = () => useStore(store, (s) => s.count);
 
-    const hook = renderHook(() => useStore((s) => s.count));
+    const hook = renderHook(() => useCount());
     expect(hook.get()).toBe(7);
 
     act(() => {
@@ -1246,7 +1249,7 @@ describe("hook bindings", () => {
     hook.unmount();
   });
 
-  it("useMeta works detached from its action handle", async () => {
+  it("a wrapper hook around useActionMeta tracks the handle", async () => {
     const store = createStore({ state: { value: "" } });
     const { load } = store.actions({
       load: async ({ set }) => {
@@ -1254,9 +1257,9 @@ describe("hook bindings", () => {
         set({ value: "done" });
       },
     });
-    const { useMeta } = load;
+    const useLoadMeta = () => useActionMeta(load);
 
-    const hook = renderHook(() => useMeta());
+    const hook = renderHook(() => useLoadMeta());
     expect(hook.get().status).toBe("idle");
 
     await act(async () => {
@@ -1290,7 +1293,7 @@ describe("useStore with a throwing derived value", () => {
     });
 
     function View() {
-      return <span>value:{store.useStore((s) => s.a)}</span>;
+      return <span>value:{useStore(store, (s) => s.a)}</span>;
     }
 
     const container = document.createElement("div");
@@ -1324,7 +1327,7 @@ describe("useStore SSR", () => {
     const store = createStore({ state: { count: 42, label: "server" } });
 
     function Component() {
-      const count = store.useStore((s) => s.count);
+      const count = useStore(store, (s) => s.count);
       return <div>{count}</div>;
     }
 
@@ -1338,7 +1341,11 @@ describe("useStore SSR", () => {
     });
 
     function Component() {
-      const { count, label } = store.useStore((s) => ({ count: s.count, label: s.label }), shallow);
+      const { count, label } = useStore(
+        store,
+        (s) => ({ count: s.count, label: s.label }),
+        shallow,
+      );
       return (
         <div>
           {count}
@@ -1381,7 +1388,7 @@ describe("useMeta", () => {
         set({ value: "done" });
       },
     });
-    const hook = renderHook(() => load.useMeta());
+    const hook = renderHook(() => useActionMeta(load));
     expect(hook.get()).toEqual({ status: "idle", error: undefined });
 
     let promise!: Promise<void>;
@@ -1406,7 +1413,7 @@ describe("useMeta", () => {
         throw failure;
       },
     });
-    const hook = renderHook(() => load.useMeta());
+    const hook = renderHook(() => useActionMeta(load));
 
     await act(async () => {
       await load().catch(() => {});
@@ -1732,6 +1739,52 @@ describe("prototype-named state keys", () => {
     store.setState({ toString: "updated" });
 
     expect(store.getState().toString).toBe("updated");
+  });
+});
+
+describe("state/derived key collision", () => {
+  it("throws at creation when a key is declared in both state and derived", () => {
+    expect(() =>
+      createStore<{ total: number }, { total: number }>({
+        state: { total: 1 },
+        derived: { total: () => 2 },
+      }),
+    ).toThrow(/"total".*both/);
+  });
+
+  it("does not throw when state and derived keys are disjoint", () => {
+    expect(() =>
+      createStore<{ count: number }, { doubled: number }>({
+        state: { count: 1 },
+        derived: { doubled: (s) => s.count * 2 },
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("duplicate action registration", () => {
+  it("warns in dev when a second actions() call reuses an action name", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore({ state: { n: 0 } });
+
+    store.actions({ bump: ({ set }) => set((s) => ({ n: s.n + 1 })) });
+    expect(warn).not.toHaveBeenCalled();
+
+    store.actions({ bump: ({ set }) => set((s) => ({ n: s.n + 2 })) });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"bump"'));
+    warn.mockRestore();
+  });
+
+  it("does not warn for distinct names across actions() calls", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore({ state: { n: 0 } });
+
+    store.actions({ bump: ({ set }) => set((s) => ({ n: s.n + 1 })) });
+    store.actions({ reset: ({ set }) => set({ n: 0 }) });
+
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 

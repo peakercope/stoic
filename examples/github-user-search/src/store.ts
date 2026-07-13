@@ -1,4 +1,4 @@
-import { createStore } from "../../../src/stoic";
+import { createStore } from "stoic-store";
 import type { GitHubUser, Profile, Repo } from "./api";
 import * as api from "./api";
 

@@ -1,6 +1,6 @@
 import type { ComponentProps } from "react";
 import { describe, expectTypeOf, it } from "vitest";
-import { createStoreContext } from "./context";
+import { createStoreContext, useActionMeta, useStore } from "./react";
 import { type ActionMeta, createStore, type StoicPlugin, type StoicStore } from "./stoic";
 
 describe("action return types", () => {
@@ -87,11 +87,15 @@ describe("store state and derived inference", () => {
     derived.setState({ missing: 1 });
   });
 
-  it("useStore infers the selector result and equality argument", () => {
-    expectTypeOf(derived.useStore).parameter(0).parameter(0).toEqualTypeOf<State & Derived>();
-    expectTypeOf(derived.useStore((s) => s.doubled)).toEqualTypeOf<number>();
-    expectTypeOf(plain.useStore()).toEqualTypeOf<{ count: number; label: string }>();
-    derived.useStore(
+  it("useStore infers the selector result and equality argument from the store", () => {
+    useStore(derived, (s) => {
+      expectTypeOf(s).toEqualTypeOf<State & Derived>();
+      return s;
+    });
+    expectTypeOf(useStore(derived, (s) => s.doubled)).toEqualTypeOf<number>();
+    expectTypeOf(useStore(plain)).toEqualTypeOf<{ count: number; label: string }>();
+    useStore(
+      derived,
       (s) => ({ count: s.count }),
       (a, b) => {
         expectTypeOf(a).toEqualTypeOf<{ count: number }>();
@@ -114,7 +118,7 @@ describe("store state and derived inference", () => {
   it("action meta is typed", () => {
     const { inc } = plain.actions({ inc: ({ set }) => set((s) => ({ count: s.count + 1 })) });
     expectTypeOf(inc.getMeta()).toEqualTypeOf<ActionMeta>();
-    expectTypeOf(inc.useMeta()).toEqualTypeOf<ActionMeta>();
+    expectTypeOf(useActionMeta(inc)).toEqualTypeOf<ActionMeta>();
   });
 
   it("a plugin's afterSetState receives the full state and the acting action", () => {

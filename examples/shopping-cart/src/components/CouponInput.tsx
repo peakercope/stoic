@@ -1,9 +1,10 @@
 import { type SubmitEvent, useState } from "react";
+import { useStore } from "stoic-store/react";
 import { coupons } from "../data";
 import { applyCoupon, cart, removeCoupon } from "../store";
 
 export function CouponInput() {
-  const coupon = cart.useStore((s) => s.coupon);
+  const coupon = useStore(cart, (s) => s.coupon);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
 

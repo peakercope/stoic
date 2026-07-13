@@ -2,7 +2,9 @@
 
 Self-contained applications, each solving a realistic problem and teaching one or multiple
 Stoic concepts. Every example is a standalone Vite + React + TypeScript app that imports
-Stoic from this repository's `src/`, so changes to the library show up immediately.
+Stoic by its published name (`stoic-store`), so the code is copy-pasteable into a real app;
+a Vite alias points those imports at this repository's `src/`, so changes to the library
+show up immediately.
 
 ```bash
 cd examples/shopping-cart
@@ -31,6 +33,6 @@ Then pick whichever is closest to what you're building:
 
 - **No `useMemo` for derived values.** If a value is computed from state, it's in `derived`.
 - **No hand-written `loading` / `error` flags.** Async actions expose their own status via
-  `action.useMeta()`.
+  `useActionMeta(action)`.
 - **Selectors are narrow.** Components subscribe to the values they render, and use
   `shallow` when a selector returns an object.

@@ -1,10 +1,14 @@
 import type {} from "@redux-devtools/extension";
+import { isDevEnv } from "../env";
 import type { StoicPlugin, StoicStore } from "../stoic";
 
 export interface DevtoolsOptions {
   /** Instance name in the DevTools dropdown; defaults to an auto-generated per-store name. */
   name?: string;
-  /** Whether to connect at all; defaults to `true` outside `NODE_ENV=production`. */
+  /**
+   * Whether to connect at all; defaults to `true` outside production builds
+   * (decided by `process.env.NODE_ENV`, which bundlers replace statically).
+   */
   enabled?: boolean;
   /** Label for `setState` calls made outside an action; defaults to `"anonymous"`. */
   anonymousActionType?: string;
@@ -44,11 +48,7 @@ export function devtools<T extends object, Full extends object = T>(
   const anonymousActionType = options.anonymousActionType ?? "anonymous";
   const name = options.name ?? `stoic-store-#${++anonymousStoreCount}`;
 
-  const enabled = (() => {
-    if (options.enabled !== undefined) return options.enabled;
-    const nodeProcess = (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process;
-    return nodeProcess?.env?.NODE_ENV !== "production";
-  })();
+  const enabled = options.enabled ?? isDevEnv();
 
   let store: StoicStore<T, Full> | undefined;
   let connection: Connection | undefined;

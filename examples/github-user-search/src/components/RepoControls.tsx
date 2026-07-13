@@ -1,8 +1,10 @@
-import { shallow } from "../../../../src/tools";
+import { useStore } from "stoic-store/react";
+import { shallow } from "stoic-store/tools";
 import { type SortKey, search, setHideForks, setLanguage, setSort } from "../store";
 
 export function RepoControls() {
-  const { languages, language, sort, hideForks } = search.useStore(
+  const { languages, language, sort, hideForks } = useStore(
+    search,
     (s) => ({
       languages: s.languages,
       language: s.language,

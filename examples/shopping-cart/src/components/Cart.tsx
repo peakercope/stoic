@@ -1,4 +1,5 @@
-import { shallow } from "../../../../src/tools";
+import { useStore } from "stoic-store/react";
+import { shallow } from "stoic-store/tools";
 import { cart } from "../store";
 import { CartLineItem } from "./CartLineItem";
 import { CartSummary } from "./CartSummary";
@@ -6,7 +7,8 @@ import { CouponInput } from "./CouponInput";
 import { ShippingSelector } from "./ShippingSelector";
 
 export function Cart() {
-  const { items, totalItems } = cart.useStore(
+  const { items, totalItems } = useStore(
+    cart,
     (s) => ({ items: s.items, totalItems: s.totalItems }),
     shallow,
   );

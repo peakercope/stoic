@@ -1,12 +1,13 @@
+import { useActionMeta, useStore } from "stoic-store/react";
 import { search, selectUser } from "../store";
 import { RepoControls } from "./RepoControls";
 import { RepoList } from "./RepoList";
 
 export function UserProfile() {
-  const selected = search.useStore((s) => s.selected);
-  const profile = search.useStore((s) => s.profile);
-  const totalStars = search.useStore((s) => s.totalStars);
-  const { status, error } = selectUser.useMeta();
+  const selected = useStore(search, (s) => s.selected);
+  const profile = useStore(search, (s) => s.profile);
+  const totalStars = useStore(search, (s) => s.totalStars);
+  const { status, error } = useActionMeta(selectUser);
 
   if (!selected) {
     return <p className="muted pad">Search for a user, then pick one to see their repos.</p>;

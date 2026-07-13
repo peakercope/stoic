@@ -1,3 +1,4 @@
+import { useStore } from "stoic-store/react";
 import { search } from "../store";
 
 const relative = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
@@ -11,7 +12,7 @@ function pushedAgo(iso: string): string {
 export function RepoList() {
   // `visibleRepos` is derived from repos + sort + language + hideForks, so
   // changing any control re-derives this list without touching the network.
-  const repos = search.useStore((s) => s.visibleRepos);
+  const repos = useStore(search, (s) => s.visibleRepos);
 
   if (repos.length === 0) {
     return <p className="muted pad">No repositories match these filters.</p>;

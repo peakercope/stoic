@@ -13,7 +13,13 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "stoic-store": ["../../src/index.ts"],
+      "stoic-store/react": ["../../src/react.ts"],
+      "stoic-store/plugins": ["../../src/plugins/index.ts"],
+      "stoic-store/tools": ["../../src/tools/index.ts"]
+    }
   },
   "include": ["src", "vite.config.ts"]
 }

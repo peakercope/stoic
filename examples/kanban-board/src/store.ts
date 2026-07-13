@@ -1,5 +1,5 @@
-import { persist } from "../../../src/plugins";
-import { createStore } from "../../../src/stoic";
+import { createStore } from "stoic-store";
+import { persist } from "stoic-store/plugins";
 import { type ColumnId, DONE, type Label, seedTasks, type Task } from "./data";
 
 type Filter = {

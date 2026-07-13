@@ -607,4 +607,89 @@ describe("persist", () => {
       store.destroy();
     });
   });
+
+  describe("skipHydration", () => {
+    it("leaves initial state untouched until rehydrate() is called", () => {
+      localStorage.setItem("skip-hydration-storage", JSON.stringify({ count: 42 }));
+
+      const plugin = persist<{ count: number }>({
+        key: "skip-hydration-storage",
+        skipHydration: true,
+      });
+      const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+
+      expect(store.getState()).toEqual({ count: 0 });
+
+      plugin.rehydrate();
+      expect(store.getState()).toEqual({ count: 42 });
+      store.destroy();
+    });
+
+    it("rehydrate() applies the same filtering as init hydration", () => {
+      localStorage.setItem(
+        "skip-hydration-filter-storage",
+        JSON.stringify({ theme: "light", draft: "wip" }),
+      );
+
+      const plugin = persist<{ theme: string; draft: string }>({
+        key: "skip-hydration-filter-storage",
+        exclude: ["draft"],
+        skipHydration: true,
+      });
+      const store = createStore({ state: { theme: "dark", draft: "" }, plugins: [plugin] });
+
+      plugin.rehydrate();
+
+      expect(store.getState()).toEqual({ theme: "light", draft: "" });
+      store.destroy();
+    });
+
+    it("rehydrate() before the plugin is attached to a store warns and does nothing", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const plugin = persist<{ count: number }>({ key: "unattached-storage" });
+      plugin.rehydrate();
+
+      expect(warn).toHaveBeenCalledOnce();
+      warn.mockRestore();
+    });
+
+    it("rehydrate() is a no-op without stored data", () => {
+      const plugin = persist<{ count: number }>({
+        key: "skip-hydration-empty-storage",
+        skipHydration: true,
+      });
+      const store = createStore({ state: { count: 7 }, plugins: [plugin] });
+
+      plugin.rehydrate();
+
+      expect(store.getState()).toEqual({ count: 7 });
+      store.destroy();
+    });
+  });
+
+  describe("unavailable storage in production", () => {
+    it("stays silent about unavailable storage in production builds", () => {
+      vi.stubEnv("NODE_ENV", "production");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "prod-unavailable-storage",
+            storage: () => {
+              throw new Error("no storage here");
+            },
+          }),
+        ],
+      });
+      store.setState({ count: 1 });
+
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+      store.destroy();
+    });
+  });
 });

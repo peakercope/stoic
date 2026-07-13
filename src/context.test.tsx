@@ -1,9 +1,10 @@
 import * as React from "react";
 import { act, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { createStoreContext } from "./context";
 import { persist } from "./plugins";
+import { createStoreContext, useActionMeta } from "./react";
 import { createStore, type StoicPlugin } from "./stoic";
 import { shallow } from "./tools";
 
@@ -141,7 +142,7 @@ describe("createStoreContext", () => {
     view.unmount();
   });
 
-  it("returns stable action handles whose useMeta tracks async status", async () => {
+  it("returns stable action handles whose useActionMeta tracks async status", async () => {
     const { Provider, useActions } = makeCartContext();
     const seen: string[] = [];
     let handles: ReturnType<typeof useActions> | undefined;
@@ -151,7 +152,7 @@ describe("createStoreContext", () => {
       const actions = useActions();
       if (handles && handles !== actions) sameHandles = false;
       handles = actions;
-      seen.push(actions.loadItems.useMeta().status);
+      seen.push(useActionMeta(actions.loadItems).status);
       return null;
     }
 
@@ -376,5 +377,65 @@ describe("createStoreContext", () => {
     }
 
     errors.mockRestore();
+  });
+
+  describe("server rendering with persist", () => {
+    const makePersistedCartContext = (storage?: () => Storage) =>
+      createStoreContext((init: string[] = []) => {
+        const plugin = persist<CartState>({
+          key: "ssr-cart-storage",
+          ...(storage ? { storage } : {}),
+          skipHydration: true,
+        });
+        const store = createStore<CartState, CartDerived>({
+          state: { items: init, taxRate: 0.2 },
+          derived: { count: ({ items }) => items.length },
+          plugins: [plugin],
+        });
+        // Handing rehydrate out through the bundle lets components trigger it
+        // from an effect — after React hydration, so server and client markup
+        // agree on the first client render.
+        return { store, actions: { rehydrate: plugin.rehydrate } };
+      });
+
+    it("renders server HTML from initial state when storage is unavailable", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { Provider, useStore } = makePersistedCartContext(() => {
+        throw new Error("no localStorage on the server");
+      });
+
+      function Count() {
+        return <span>{`count:${useStore((s) => s.count)}`}</span>;
+      }
+      const html = renderToString(
+        <Provider init={["a"]}>
+          <Count />
+        </Provider>,
+      );
+
+      expect(html).toContain("count:1");
+      warn.mockRestore();
+    });
+
+    it("applies the stored payload on the client once rehydrate() runs in an effect", () => {
+      localStorage.setItem("ssr-cart-storage", JSON.stringify({ items: ["one", "two"] }));
+      const { Provider, useStore, useActions } = makePersistedCartContext();
+
+      function Cart() {
+        const count = useStore((s) => s.count);
+        const { rehydrate } = useActions();
+        React.useEffect(() => rehydrate(), [rehydrate]);
+        return <span>client:{count}</span>;
+      }
+      const view = render(
+        <Provider init={["a"]}>
+          <Cart />
+        </Provider>,
+      );
+
+      expect(view.container.textContent).toBe("client:2");
+      view.unmount();
+      localStorage.removeItem("ssr-cart-storage");
+    });
   });
 });

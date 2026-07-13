@@ -1,9 +1,11 @@
-import { shallow } from "../../../../src/tools";
+import { useStore } from "stoic-store/react";
+import { shallow } from "stoic-store/tools";
 import { assignees, type Label, labels } from "../data";
 import { board, setAssignee, setLabel, setSearch } from "../store";
 
 export function FilterBar() {
-  const { filter, visible, total } = board.useStore(
+  const { filter, visible, total } = useStore(
+    board,
     (s) => ({
       filter: s.filter,
       visible: s.filteredTasks.length,

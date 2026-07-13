@@ -1,3 +1,4 @@
+import { useStore } from "stoic-store/react";
 import { cart, type ShippingMethod, setShippingMethod } from "../store";
 
 const OPTIONS: { value: ShippingMethod; label: string; hint: string }[] = [
@@ -7,7 +8,7 @@ const OPTIONS: { value: ShippingMethod; label: string; hint: string }[] = [
 ];
 
 export function ShippingSelector() {
-  const shippingMethod = cart.useStore((s) => s.shippingMethod);
+  const shippingMethod = useStore(cart, (s) => s.shippingMethod);
 
   return (
     <fieldset className="shipping">

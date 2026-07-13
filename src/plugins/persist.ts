@@ -1,4 +1,5 @@
-import type { StoicPlugin } from "../stoic";
+import { isDevEnv } from "../env";
+import type { StoicPlugin, StoicStore } from "../stoic";
 
 // Derived values are always recomputed from raw state, so they are dropped on
 // the way out (never written) and on the way back in (a persisted derived value
@@ -29,11 +30,22 @@ function filterKeys<T extends object>(
   return result;
 }
 
+/** What `persist` returns: the plugin hooks plus a manual hydration trigger. */
+export type PersistPlugin<T extends object> = StoicPlugin<T, T> & {
+  /**
+   * Reads storage and merges the stored state into the store now. Meant for
+   * `skipHydration` setups; a no-op when nothing is stored or storage is
+   * unavailable. State written before `rehydrate()` is persisted over the
+   * stored payload, so rehydrate before writing.
+   */
+  rehydrate: () => void;
+};
+
 /**
  * Saves raw state to storage on every change and restores it when the store
  * is created. Derived values are never persisted — they are recomputed from
  * raw state on load. When storage is unavailable (e.g. `localStorage` on a
- * server), the plugin disables itself with a single warning.
+ * server), the plugin disables itself with a single dev-only warning.
  */
 export function persist<T extends object>(options: {
   /** Storage key the state is saved under. */
@@ -59,7 +71,14 @@ export function persist<T extends object>(options: {
   version?: number;
   /** Upgrades a payload written by an older `version` to the current shape. */
   migrate?: (persisted: unknown, version: number) => Partial<T>;
-}): StoicPlugin<T, T> {
+  /**
+   * Skip the automatic hydration at store creation; call `rehydrate()` on the
+   * plugin instance when you want it. Useful with server rendering, where
+   * hydrating from `localStorage` during React hydration would make the
+   * client render differ from the server HTML.
+   */
+  skipHydration?: boolean;
+}): PersistPlugin<T> {
   if (options.include && options.exclude) {
     throw new Error("persist: pass either `include` or `exclude`, not both");
   }
@@ -144,8 +163,48 @@ export function persist<T extends object>(options: {
   let pendingState: T | undefined;
   let hydrating = false;
 
+  // Set in onInit; hydration (automatic or via rehydrate()) needs the store.
+  let boundStore: StoicStore<T, T> | undefined;
+
+  const hydrate = () => {
+    if (boundStore === undefined) {
+      if (isDevEnv()) {
+        console.warn(
+          "Stoic persist plugin: rehydrate() called before the plugin was attached to a " +
+            "store (pass it via createStore's `plugins`); ignored",
+        );
+      }
+      return;
+    }
+    if (storage === undefined) return;
+    try {
+      const raw = storage.getItem(options.key);
+      const payload = raw != null ? readPayload(raw) : undefined;
+      if (payload !== undefined) {
+        const parsed = filterKeys(payload as T, options, derivedKeys);
+        // Drop keys the store no longer has: a stale payload would otherwise
+        // merge them into state and re-persist them forever.
+        const current = boundStore.getState();
+        for (const key of Object.keys(parsed) as (keyof T)[]) {
+          if (!(key in current)) delete parsed[key];
+        }
+        // Writing back what was just read is pointless; suppress the
+        // afterSetState this rehydration triggers.
+        hydrating = true;
+        try {
+          boundStore.setState(parsed);
+        } finally {
+          hydrating = false;
+        }
+      }
+    } catch {
+      console.warn("Stoic persist plugin: failed to read state from storage");
+    }
+  };
+
   return {
     onInit(store) {
+      boundStore = store;
       // Derived values are exposed as getter properties on snapshots (a
       // documented invariant of the core, pinned by its tests); raw keys are
       // plain data properties. Inspecting descriptors doesn't compute anything.
@@ -171,37 +230,18 @@ export function persist<T extends object>(options: {
         storage = undefined;
       }
       if (storage === undefined) {
-        console.warn(
-          `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
-            "persistence is disabled for this store",
-        );
+        if (isDevEnv()) {
+          console.warn(
+            `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
+              "persistence is disabled for this store",
+          );
+        }
         return;
       }
 
-      try {
-        const raw = storage.getItem(options.key);
-        const payload = raw != null ? readPayload(raw) : undefined;
-        if (payload !== undefined) {
-          const parsed = filterKeys(payload as T, options, derivedKeys);
-          // Drop keys the store no longer has: a stale payload would otherwise
-          // merge them into state and re-persist them forever.
-          const current = store.getState();
-          for (const key of Object.keys(parsed) as (keyof T)[]) {
-            if (!(key in current)) delete parsed[key];
-          }
-          // Writing back what was just read is pointless; suppress the
-          // afterSetState this rehydration triggers.
-          hydrating = true;
-          try {
-            store.setState(parsed);
-          } finally {
-            hydrating = false;
-          }
-        }
-      } catch {
-        console.warn("Stoic persist plugin: failed to read state from storage");
-      }
+      if (!options.skipHydration) hydrate();
     },
+    rehydrate: hydrate,
     afterSetState(state) {
       if (hydrating || storage === undefined) return;
 

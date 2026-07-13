@@ -1,8 +1,10 @@
-import { shallow } from "../../../../src/tools";
+import { useStore } from "stoic-store/react";
+import { shallow } from "stoic-store/tools";
 import { board } from "../store";
 
 export function BoardStats() {
-  const { completedCount, overdueCount, completionRate, total } = board.useStore(
+  const { completedCount, overdueCount, completionRate, total } = useStore(
+    board,
     (s) => ({
       completedCount: s.completedCount,
       overdueCount: s.overdueCount,

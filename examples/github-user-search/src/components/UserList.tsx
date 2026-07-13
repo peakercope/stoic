@@ -1,9 +1,10 @@
+import { useActionMeta, useStore } from "stoic-store/react";
 import { findUsers, search, selectUser } from "../store";
 
 export function UserList() {
-  const results = search.useStore((s) => s.results);
-  const selected = search.useStore((s) => s.selected);
-  const { status } = findUsers.useMeta();
+  const results = useStore(search, (s) => s.results);
+  const selected = useStore(search, (s) => s.selected);
+  const { status } = useActionMeta(findUsers);
 
   if (status === "success" && results.length === 0) {
     return <p className="muted pad">No users matched that search.</p>;

@@ -24,6 +24,7 @@ No reducers • No dependency arrays • No boilerplate • Fully typed • Plug
 <a href="#batching">Batching</a> •
 <a href="#plugins">Plugins</a> •
 <a href="#per-instance-stores">Per-instance Stores</a> •
+<a href="#api-reference">API Reference</a> •
 <a href="#testing">Testing</a> •
 <a href="#faq">FAQ</a>
 </p>
@@ -51,6 +52,15 @@ yarn add stoic-store
 ```
 
 Stoic requires React 18 or later (it uses `useSyncExternalStore`). The package is published as **ESM only** — every modern bundler and Node 18+ consume it as-is, but legacy CommonJS-only toolchains are not supported.
+
+The package has four entry points:
+
+| Entry | Contents |
+| --- | --- |
+| `stoic-store` | `createStore` and the store itself. **React-free** — safe to import anywhere, including React Server Components. |
+| `stoic-store/react` | The hooks: `useStore`, `useActionMeta`, and `createStoreContext`. |
+| `stoic-store/plugins` | The built-in `persist` and `devtools` plugins. |
+| `stoic-store/tools` | The `shallow` equality helper. |
 
 ---
 
@@ -103,11 +113,13 @@ export const { setTax, addItem } = cart.actions({
 });
 ```
 
-Read from it in a component with `useStore`:
+Read from it in a component with the `useStore` hook:
 
 ```tsx
+import { useStore } from "stoic-store/react";
+
 function CartSummary() {
-  const total = cart.useStore((state) => state.total);
+  const total = useStore(cart, (state) => state.total);
 
   return <h2>Total: ${total}</h2>;
 }
@@ -144,11 +156,11 @@ Everything else in Stoic is built on top of these four concepts.
 
 ## Reading State
 
-`useStore()` subscribes a component to the store. Call it with no arguments to read the whole state:
+`useStore(store)` (from `stoic-store/react`) subscribes a component to a store. Call it with just the store to read the whole state:
 
 ```tsx
 function Cart() {
-  const { items } = cart.useStore();
+  const { items } = useStore(cart);
 
   return (
     <ul>
@@ -163,15 +175,16 @@ function Cart() {
 Pass a selector to subscribe to a single value — the component only rerenders when that value changes, not on every store update:
 
 ```tsx
-const total = cart.useStore((state) => state.total);
+const total = useStore(cart, (state) => state.total);
 ```
 
-When a selector returns an object or array, it's a new reference on every render, so pass an equality function as the second argument to avoid rerendering when the contents haven't actually changed. Stoic ships a `shallow` helper for this:
+When a selector returns an object or array, it's a new reference on every render, so pass an equality function as the third argument to avoid rerendering when the contents haven't actually changed. Stoic ships a `shallow` helper for this:
 
 ```tsx
 import { shallow } from "stoic-store/tools";
 
-const { subtotal, total } = cart.useStore(
+const { subtotal, total } = useStore(
+  cart,
   (state) => ({ subtotal: state.subtotal, total: state.total }),
   shallow,
 );
@@ -179,18 +192,19 @@ const { subtotal, total } = cart.useStore(
 
 You can also pass any custom `(a, b) => boolean` function instead of `shallow`. `shallow` compares plain objects and arrays one level deep and Maps/Sets by size and membership; other objects (Dates, class instances) are only equal by reference.
 
-### Lint-friendly hook bindings
+### Store-specific wrapper hooks
 
-ESLint's `react-hooks` rules only recognize hooks called as plain `useXxx(...)` identifiers, so method-style calls like `cart.useStore(...)` are invisible to them. The store's hooks don't rely on `this`, so bind them once and export identifier-style hooks:
+`useStore` is a plain hook, so ESLint's `react-hooks` rules understand it out of the box. If passing the store everywhere gets repetitive, wrap it once and export a store-specific hook:
 
 ```tsx
-export const useCart = cart.useStore;
+export const useCart = <U,>(selector: (state: CartFull) => U, equality?: (a: U, b: U) => boolean) =>
+  useStore(cart, selector, equality);
 
-// In components — now checked by rules-of-hooks:
+// In components:
 const total = useCart((state) => state.total);
 ```
 
-The same works for action meta: `export const useLoadUserMeta = loadUser.useMeta`.
+The same works for action meta: `export const useLoadUserMeta = () => useActionMeta(loadUser)`.
 
 ---
 
@@ -222,6 +236,8 @@ const { addItem, removeItem, clearCart } = cart.actions({
 ```
 
 Action arguments and store state are both fully typed, so your editor infers them without extra annotations.
+
+Register a given action name once per store, at module (or factory) level. Each `actions()` call builds new handles with fresh, independent status meta, so re-registering a name — say, inside a component — would silently reset its tracked status; Stoic warns in development when that happens.
 
 An action's return value is passed through to the caller — handy for returning a created id or a computed result:
 
@@ -271,10 +287,12 @@ await loadUser(42);
 
 ### Tracking status
 
-Every action exposes its current status through `.useMeta()`, so you can render loading and error states without tracking them in your own state:
+Every action handle carries the status of its most recent call. Subscribe to it in a component with `useActionMeta`, so you can render loading and error states without tracking them in your own state:
 
 ```tsx
-const { status, error } = loadUser.useMeta();
+import { useActionMeta } from "stoic-store/react";
+
+const { status, error } = useActionMeta(loadUser);
 
 if (status === "pending") {
   return <Spinner />;
@@ -285,7 +303,7 @@ if (status === "error") {
 }
 ```
 
-`status` is one of `"idle" | "pending" | "success" | "error"`.
+`status` is one of `"idle" | "pending" | "success" | "error"`. Outside React, `loadUser.getMeta()` returns the current meta and `loadUser.subscribeMeta(listener)` watches it.
 
 ### Overlapping calls and stale responses
 
@@ -368,6 +386,8 @@ Derived values are computed **lazily**: a derived key does its work the first ti
 
 > If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle — at store creation if the cycle is always present, or on the read of the cyclic value if it only appears for certain states.
 
+> A key can't be both state and derived: `createStore` throws if `state` and `derived` share a key, since the derived getter would silently shadow the state value.
+
 ---
 
 ## TypeScript
@@ -411,6 +431,8 @@ store.batch(() => {
 ```
 
 Everything called inside the callback — direct `setState` calls, actions, or both — updates state immediately but defers the notification until the outermost batch closes. If the callback throws, pending changes are kept and listeners are still notified once before the error propagates. A batch that changes nothing notifies no one.
+
+To be precise about what `batch` buys: React 18+ already coalesces multiple re-renders from the same event handler on its own. `batch` coalesces at the store level — subscribers are notified once instead of N times (which also means one render for updates fired from timers, async continuations, or non-React code), and plugins see a single `afterSetState`, so `persist` writes storage once and `devtools` logs one entry for the whole batch.
 
 Reads made *during* a batch (e.g. `store.getState()` from inside another action) always see fully consistent state — raw and derived values agree at every point.
 
@@ -488,8 +510,9 @@ Refresh the page and `settings` is restored automatically. `persist` accepts:
 | `debounceMs` | `number` | — | Delay writes, resetting the timer on each change. |
 | `version` | `number` | — | Schema version of the persisted state (see below). |
 | `migrate` | `(persisted, version) => Partial<T>` | — | Upgrade an older payload to the current shape. |
+| `skipHydration` | `boolean` | `false` | Don't hydrate at store creation; call `rehydrate()` on the plugin instance instead (see below). |
 
-`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed. If storage is unavailable (the default `localStorage` doesn't exist on a server, for example), the plugin disables itself with a single console warning instead of failing on every write.
+`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed. If storage is unavailable (the default `localStorage` doesn't exist on a server, for example), the plugin disables itself with a single development-only console warning instead of failing on every write.
 
 ```tsx
 persist({
@@ -498,6 +521,22 @@ persist({
   debounceMs: 250,               // batch rapid updates into one write
 });
 ```
+
+#### Server rendering and manual hydration
+
+By default the plugin hydrates synchronously when the store is created. With server rendering that's a problem: the server rendered HTML from the initial state, so a client store hydrated from `localStorage` before React attaches makes the first client render differ from the server markup — a hydration mismatch. Set `skipHydration` and call `rehydrate()` on the plugin instance from an effect, after React has hydrated:
+
+```tsx
+const settingsPersist = persist<Settings>({ key: "settings", skipHydration: true });
+export const settings = createStore({ state: defaults, plugins: [settingsPersist] });
+
+function SettingsRoot({ children }: { children: ReactNode }) {
+  useEffect(() => settingsPersist.rehydrate(), []);
+  return children;
+}
+```
+
+State written before `rehydrate()` runs is persisted over the stored payload, so rehydrate before writing. (With [`createStoreContext`](#per-instance-stores), create the plugin inside the factory and hand `rehydrate` out through the bundle's `actions`.)
 
 #### Versioning and migrations
 
@@ -574,7 +613,8 @@ It breaks down when **one process serves several independent trees**:
 `createStoreContext` builds a React Context around a store factory, so each mounted `Provider` gets its own store:
 
 ```tsx
-import { createStore, createStoreContext } from "stoic-store";
+import { createStore } from "stoic-store";
+import { createStoreContext } from "stoic-store/react";
 
 export const { Provider, useStore, useActions, useStoreApi } = createStoreContext(
   (initialItems: CartItem[] = []) => {
@@ -596,7 +636,7 @@ export const { Provider, useStore, useActions, useStoreApi } = createStoreContex
 );
 ```
 
-The factory returns **both** the store and its actions. Action handles close over the store they were created from, so they have to be built per instance — doing it here binds them once and keeps their identity, and their `useMeta` status, stable across renders.
+The factory returns **both** the store and its actions. Action handles close over the store they were created from, so they have to be built per instance — doing it here binds them once and keeps their identity, and their `useActionMeta` status, stable across renders.
 
 Wrap the tree in the `Provider`, optionally seeding it with `init`:
 
@@ -612,7 +652,7 @@ Components then read and act through the returned hooks, with the same ergonomic
 function CartSummary() {
   const total = useStore((state) => state.total);
   const { addItem, loadCart } = useActions();
-  const { status } = loadCart.useMeta();
+  const { status } = useActionMeta(loadCart);
 
   if (status === "pending") return <Spinner />;
   return <button onClick={() => addItem(monitor)}>Total: ${total}</button>;
@@ -622,13 +662,54 @@ function CartSummary() {
 | Returned | What it is |
 | --- | --- |
 | `Provider` | Creates one store per mount. `init` is read on the first render only — like a `defaultValue`, changing it later won't rebuild the store. The prop is required exactly when the factory can't be called without it. |
-| `useStore(selector?, equality?)` | Identical to `store.useStore`, resolved from context. |
+| `useStore(selector?, equality?)` | Like the plain `useStore` hook, with the store resolved from context. |
 | `useActions()` | This instance's action handles. Stable across renders. |
 | `useStoreApi()` | The `StoicStore` itself, for `getState` / `subscribe` / `batch` outside of render. |
 
 The store is destroyed when its `Provider` unmounts, so plugins get their `onDestroy` (a pending debounced `persist` write is flushed). This is StrictMode-safe: React's mount → unmount → mount cycle in development does not tear down the store.
 
 Inside React's [`<Activity>`](https://react.dev/reference/react/Activity) (React 19.2+), hiding a subtree behaves like an unmount for the store: it is destroyed — flushing plugins — and a fresh one is created when the subtree is revealed. In-memory state does not survive a hide; pair the store with `persist` if it should.
+
+---
+
+## API Reference
+
+### `stoic-store`
+
+| Export | What it is |
+| --- | --- |
+| `createStore({ state, derived?, plugins? })` | Builds a store. See [Quick Start](#quick-start) and [Derived State](#derived-state). |
+| `CircularDependencyError` | Thrown when derived values depend on each other in a cycle. |
+| Types | `StoicStore`, `StoicPlugin`, `SetState`, `ActionCtx`, `ActionHandle`, `ActionMeta`, `ActionStatus`, `ActionContext`, `Listener`. |
+
+The store returned by `createStore`:
+
+| Member | What it does |
+| --- | --- |
+| `getState()` | Returns the current state, including derived values. |
+| `setState(partial)` | Merges a partial state — or the result of an updater `(state) => partial` — and notifies subscribers. Derived keys are ignored with a dev warning. |
+| `subscribe(listener)` | Calls `listener(state)` after every change; returns an unsubscribe function. |
+| `actions(map)` | Turns a map of `(ctx, ...args)` functions into callable [action handles](#actions). |
+| `batch(fn)` | Runs `fn`, coalescing all notifications into one (see [Batching](#batching)). |
+| `destroy()` | Runs plugin `onDestroy` hooks and drops all listeners. |
+
+An action handle is the function itself plus `getMeta()` (the current [`ActionMeta`](#tracking-status)) and `subscribeMeta(listener)`.
+
+### `stoic-store/react`
+
+| Export | What it is |
+| --- | --- |
+| `useStore(store, selector?, equality?)` | Subscribes the component to `store`; see [Reading State](#reading-state). |
+| `useActionMeta(action)` | Subscribes the component to an action handle's status; see [Tracking status](#tracking-status). |
+| `createStoreContext(factory)` | One store per mounted `Provider`; see [Per-instance stores](#per-instance-stores). |
+
+### `stoic-store/plugins`
+
+[`persist`](#built-in-persist) and [`devtools`](#built-in-devtools).
+
+### `stoic-store/tools`
+
+[`shallow`](#reading-state), the one-level-deep equality helper for object-returning selectors.
 
 ---
 
@@ -701,7 +782,7 @@ export const settings = createStore(/* ... */);
 
 ### Does Stoic work with Server Components?
 
-Yes, but `useStore` relies on `useSyncExternalStore`, a hook — so any component that calls it needs the `"use client"` directive, the same requirement as every other React state library.
+Yes. The core entry (`stoic-store`) is React-free, so a store module can be imported from a Server Component without pulling client-side React in — reading `getState()` or calling actions there just works. The hooks live in `stoic-store/react`, and any component that calls them needs the `"use client"` directive, the same requirement as every other React state library. (For per-user data on the server, see the next question.)
 
 ### Can I use module-level stores with server-side rendering?
 
