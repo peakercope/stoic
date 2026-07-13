@@ -163,11 +163,19 @@ describe("createStoreContext", () => {
 
     expect(seen.at(-1)).toBe("idle");
 
+    // Invoke in a sync act: React 18's act defers renders scheduled inside an
+    // async callback until it resolves, so awaiting the action in the same act
+    // would flush only after meta already reads "success".
+    let promise: Promise<void> | undefined;
+    act(() => {
+      promise = handles?.loadItems(["a", "b"]);
+    });
+    expect(seen.at(-1)).toBe("pending");
+
     await act(async () => {
-      await handles?.loadItems(["a", "b"]);
+      await promise;
     });
 
-    expect(seen).toContain("pending");
     expect(seen.at(-1)).toBe("success");
     expect(sameHandles).toBe(true);
 
