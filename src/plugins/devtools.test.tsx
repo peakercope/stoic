@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStore } from "../stoic";
 import { devtools } from "./devtools";
+import { persist } from "./persist";
 
 type Listener = (message: {
   type: string;
@@ -65,8 +66,8 @@ describe("devtools", () => {
     });
 
     const actions = store.actions({
-      increment: (setState) => {
-        setState((s) => ({ count: s.count + 1 }));
+      increment: ({ set }) => {
+        set((s) => ({ count: s.count + 1 }));
       },
     });
 
@@ -87,6 +88,67 @@ describe("devtools", () => {
     store.setState({ count: 5 });
 
     expect(extension.send).toHaveBeenCalledWith({ type: "anonymous" }, { count: 5 });
+    store.destroy();
+  });
+
+  it("attributes post-await writes of overlapping async actions to the right action", async () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { a: 0, b: 0 },
+      plugins: [devtools<{ a: number; b: number }>({})],
+    });
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { slow, fast } = store.actions({
+      slow: async ({ set }) => {
+        await gate;
+        set({ a: 1 });
+      },
+      fast: async ({ set }) => {
+        set({ b: 1 });
+      },
+    });
+
+    const slowPromise = slow();
+    await fast();
+    release();
+    await slowPromise;
+
+    expect(extension.send).toHaveBeenCalledWith({ type: "fast" }, { a: 0, b: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "slow" }, { a: 1, b: 1 });
+    store.destroy();
+  });
+
+  it("keeps unrelated writes anonymous while an async action is in flight", async () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { a: 0, b: 0 },
+      plugins: [devtools<{ a: number; b: number }>({})],
+    });
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { slow } = store.actions({
+      slow: async ({ set }) => {
+        await gate;
+        set({ a: 1 });
+      },
+    });
+
+    const slowPromise = slow();
+    store.setState({ b: 1 });
+    release();
+    await slowPromise;
+
+    expect(extension.send).toHaveBeenCalledWith({ type: "anonymous" }, { a: 0, b: 1 });
+    expect(extension.send).toHaveBeenCalledWith({ type: "slow" }, { a: 1, b: 1 });
     store.destroy();
   });
 
@@ -159,6 +221,34 @@ describe("devtools", () => {
 
     storeA.destroy();
     storeB.destroy();
+  });
+
+  it("composes with persist on the same store: both observe one update, derived stays out of storage", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 0 },
+      derived: { doubled: (s) => s.count * 2 },
+      plugins: [
+        persist<{ count: number }>({ key: "composed-storage" }),
+        devtools<{ count: number }, { count: number; doubled: number }>({}),
+      ],
+    });
+    const { inc } = store.actions({
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
+    });
+
+    inc();
+
+    expect(JSON.parse(localStorage.getItem("composed-storage") as string)).toEqual({ count: 1 });
+    expect(extension.send).toHaveBeenCalledTimes(1);
+    expect(extension.send).toHaveBeenCalledWith(
+      { type: "inc" },
+      expect.objectContaining({ count: 1 }),
+    );
+    expect(store.getState().doubled).toBe(2);
+    localStorage.removeItem("composed-storage");
+    store.destroy();
   });
 
   it("does nothing when the devtools extension is not present", () => {

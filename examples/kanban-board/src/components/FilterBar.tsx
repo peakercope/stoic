@@ -1,4 +1,4 @@
-import { batch, shallow } from "../../../../src/tools";
+import { shallow } from "../../../../src/tools";
 import { assignees, type Label, labels } from "../data";
 import { board, setAssignee, setLabel, setSearch } from "../store";
 
@@ -14,10 +14,10 @@ export function FilterBar() {
 
   const isFiltered = visible !== total;
 
-  // Three actions, one render. Without `batch` this would recompute the derived
-  // board three times and rerender every column three times.
+  // Three actions, one render. Without `batch` this would notify subscribers
+  // three times and rerender every column three times.
   const clearFilters = () =>
-    batch(board, () => {
+    board.batch(() => {
       setSearch("");
       setAssignee(null);
       setLabel(null);

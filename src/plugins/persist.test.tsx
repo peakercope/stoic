@@ -165,14 +165,19 @@ describe("persist", () => {
     rehydrated.destroy();
   });
 
-  it("throws if both debounceMs and throttleMs are passed", () => {
-    expect(() =>
-      persist<{ count: number }>({
-        key: "invalid-batching-storage",
-        debounceMs: 100,
-        throttleMs: 100,
-      }),
-    ).toThrow();
+  it("does not write back to storage during rehydration", () => {
+    localStorage.setItem("no-writeback-storage", JSON.stringify({ count: 7 }));
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [persist<{ count: number }>({ key: "no-writeback-storage" })],
+    });
+
+    expect(store.getState().count).toBe(7);
+    expect(setItem).not.toHaveBeenCalled();
+    setItem.mockRestore();
+    store.destroy();
   });
 
   describe("derived", () => {
@@ -204,8 +209,11 @@ describe("persist", () => {
       });
 
       expect(store.getState().doubled).toBe(0);
+
+      // The stale payload is scrubbed on the next real write.
+      store.setState({ count: 1 });
       expect(JSON.parse(localStorage.getItem("derived-stale-storage") as string)).toEqual({
-        count: 0,
+        count: 1,
       });
       store.destroy();
     });
@@ -338,54 +346,92 @@ describe("persist", () => {
     });
   });
 
-  describe("throttleMs", () => {
-    beforeEach(() => {
-      vi.useFakeTimers();
-    });
-
-    afterEach(() => {
-      vi.useRealTimers();
-    });
-
-    it("writes immediately on the first update, then trailing-writes the final state", () => {
+  describe("version and migrate", () => {
+    it("writes a versioned envelope when version is set", () => {
       const store = createStore({
         state: { count: 0 },
-        plugins: [
-          persist<{ count: number }>({
-            key: "throttle-storage",
-            throttleMs: 100,
-          }),
-        ],
+        plugins: [persist<{ count: number }>({ key: "versioned-storage", version: 2 })],
       });
 
       store.setState({ count: 1 });
-      expect(localStorage.getItem("throttle-storage")).toBe(JSON.stringify({ count: 1 }));
 
-      store.setState({ count: 2 });
-      store.setState({ count: 3 });
-      expect(localStorage.getItem("throttle-storage")).toBe(JSON.stringify({ count: 1 }));
-
-      vi.advanceTimersByTime(100);
-      expect(localStorage.getItem("throttle-storage")).toBe(JSON.stringify({ count: 3 }));
+      expect(JSON.parse(localStorage.getItem("versioned-storage") as string)).toEqual({
+        version: 2,
+        state: JSON.stringify({ count: 1 }),
+      });
       store.destroy();
     });
 
-    it("flushes a pending trailing write immediately on destroy", () => {
+    it("rehydrates an envelope whose version matches", () => {
+      localStorage.setItem(
+        "versioned-match-storage",
+        JSON.stringify({ version: 3, state: JSON.stringify({ count: 9 }) }),
+      );
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "versioned-match-storage", version: 3 })],
+      });
+
+      expect(store.getState().count).toBe(9);
+      store.destroy();
+    });
+
+    it("runs migrate on an older payload and hydrates its result", () => {
+      localStorage.setItem(
+        "versioned-migrate-storage",
+        JSON.stringify({ version: 1, state: JSON.stringify({ count: "7" }) }),
+      );
+      const migrate = vi.fn((persisted: unknown) => ({
+        count: Number((persisted as { count: string }).count),
+      }));
+
       const store = createStore({
         state: { count: 0 },
         plugins: [
-          persist<{ count: number }>({
-            key: "throttle-destroy-storage",
-            throttleMs: 100,
-          }),
+          persist<{ count: number }>({ key: "versioned-migrate-storage", version: 2, migrate }),
         ],
       });
 
-      store.setState({ count: 1 });
-      store.setState({ count: 9 });
+      expect(migrate).toHaveBeenCalledWith({ count: "7" }, 1);
+      expect(store.getState().count).toBe(7);
       store.destroy();
+    });
 
-      expect(localStorage.getItem("throttle-destroy-storage")).toBe(JSON.stringify({ count: 9 }));
+    it("discards stored state and warns on version mismatch without migrate", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      localStorage.setItem(
+        "versioned-discard-storage",
+        JSON.stringify({ version: 1, state: JSON.stringify({ count: 9 }) }),
+      );
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "versioned-discard-storage", version: 2 })],
+      });
+
+      expect(store.getState().count).toBe(0);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("version"));
+      warnSpy.mockRestore();
+      store.destroy();
+    });
+
+    it("treats a legacy bare payload as version 0 and migrates it", () => {
+      localStorage.setItem("versioned-legacy-storage", JSON.stringify({ count: "4" }));
+      const migrate = vi.fn((persisted: unknown) => ({
+        count: Number((persisted as { count: string }).count),
+      }));
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({ key: "versioned-legacy-storage", version: 1, migrate }),
+        ],
+      });
+
+      expect(migrate).toHaveBeenCalledWith({ count: "4" }, 0);
+      expect(store.getState().count).toBe(4);
+      store.destroy();
     });
   });
 

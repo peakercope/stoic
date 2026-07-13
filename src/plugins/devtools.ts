@@ -1,5 +1,5 @@
 import type {} from "@redux-devtools/extension";
-import type { ActionContext, StoicPlugin, StoicStore } from "../stoic";
+import type { StoicPlugin, StoicStore } from "../stoic";
 
 export interface DevtoolsOptions {
   name?: string;
@@ -46,13 +46,17 @@ export function devtools<T extends object, Full extends object = T>(
   let connection: Connection | undefined;
   let initialState: Full | undefined;
   let isRecording = true;
-  let pendingActionName: string | undefined;
+  let derivedKeys: readonly string[] = [];
 
   const setStateFromDevtools = (state: Full) => {
     if (!store) return;
+    // Serialized devtools payloads include derived values; they are computed
+    // from raw state, so strip them before writing back.
+    const next = { ...state } as Record<string, unknown>;
+    for (const key of derivedKeys) delete next[key];
     const wasRecording = isRecording;
     isRecording = false;
-    store.setState(state);
+    store.setState(next as Partial<T>);
     // Restore rather than force `true`: a jump while recording is paused
     // must not silently re-enable recording.
     isRecording = wasRecording;
@@ -62,6 +66,11 @@ export function devtools<T extends object, Full extends object = T>(
     onInit(s) {
       store = s;
       initialState = s.getState();
+      // Derived values are getter properties on snapshots (core invariant);
+      // raw keys are plain data properties.
+      derivedKeys = Object.keys(initialState).filter(
+        (key) => Object.getOwnPropertyDescriptor(initialState, key)?.get !== undefined,
+      );
 
       if (!enabled) return;
       const extension =
@@ -114,15 +123,9 @@ export function devtools<T extends object, Full extends object = T>(
         }
       });
     },
-    beforeAction(ctx: ActionContext<Full>) {
-      pendingActionName = ctx.name;
-    },
-    afterAction() {
-      pendingActionName = undefined;
-    },
-    afterSetState(state) {
+    afterSetState(state, actionName) {
       if (!isRecording || !connection) return;
-      connection.send({ type: pendingActionName ?? anonymousActionType }, state);
+      connection.send({ type: actionName ?? anonymousActionType }, state);
     },
     onDestroy() {
       connection?.unsubscribe();

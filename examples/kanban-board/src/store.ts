@@ -11,6 +11,9 @@ type Filter = {
 type BoardState = {
   tasks: Task[];
   filter: Filter;
+  /** Today's date (YYYY-MM-DD), captured once at load. Derived functions must
+   * stay pure, so the clock is read here — in state — not inside `derived`. */
+  today: string;
 };
 
 type BoardDerived = {
@@ -36,6 +39,7 @@ export const board = createStore<BoardState, BoardDerived>({
   state: {
     tasks: seedTasks,
     filter: { search: "", assignee: null, label: null },
+    today: today(),
   },
 
   // The board's whole view model is derived. Columns, counts and the overdue
@@ -60,8 +64,8 @@ export const board = createStore<BoardState, BoardDerived>({
     // `tasks`, and a search doesn't make your progress bar move.
     completedCount: ({ tasks }) => tasks.filter((task) => task.columnId === DONE).length,
 
-    overdueTasks: ({ tasks }) =>
-      tasks.filter((task) => task.columnId !== DONE && task.dueDate < today()),
+    overdueTasks: ({ tasks, today }) =>
+      tasks.filter((task) => task.columnId !== DONE && task.dueDate < today),
 
     // Derived from derived.
     overdueCount: ({ overdueTasks }) => overdueTasks.length,
@@ -76,28 +80,27 @@ export const board = createStore<BoardState, BoardDerived>({
 });
 
 export const { addTask, moveTask, deleteTask, setSearch, setAssignee, setLabel } = board.actions({
-  addTask: (setState, task: Omit<Task, "id">) => {
-    setState((s) => ({
+  addTask: ({ set }, task: Omit<Task, "id">) => {
+    set((s) => ({
       tasks: [...s.tasks, { ...task, id: crypto.randomUUID() }],
     }));
   },
 
   /** Drag-and-drop is just this: a task's column *is* its status. */
-  moveTask: (setState, id: string, columnId: ColumnId) => {
-    setState((s) => ({
+  moveTask: ({ set }, id: string, columnId: ColumnId) => {
+    set((s) => ({
       tasks: s.tasks.map((task) => (task.id === id ? { ...task, columnId } : task)),
     }));
   },
 
-  deleteTask: (setState, id: string) => {
-    setState((s) => ({ tasks: s.tasks.filter((task) => task.id !== id) }));
+  deleteTask: ({ set }, id: string) => {
+    set((s) => ({ tasks: s.tasks.filter((task) => task.id !== id) }));
   },
 
-  setSearch: (setState, search: string) => setState((s) => ({ filter: { ...s.filter, search } })),
+  setSearch: ({ set }, search: string) => set((s) => ({ filter: { ...s.filter, search } })),
 
-  setAssignee: (setState, assignee: string | null) =>
-    setState((s) => ({ filter: { ...s.filter, assignee } })),
+  setAssignee: ({ set }, assignee: string | null) =>
+    set((s) => ({ filter: { ...s.filter, assignee } })),
 
-  setLabel: (setState, label: Label | null) =>
-    setState((s) => ({ filter: { ...s.filter, label } })),
+  setLabel: ({ set }, label: Label | null) => set((s) => ({ filter: { ...s.filter, label } })),
 });

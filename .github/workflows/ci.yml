@@ -34,3 +34,29 @@ jobs:
 
       - name: Build
         run: yarn build
+
+  # The peer range allows React >=18, so the suite must also pass against the
+  # oldest supported major.
+  test-react-18:
+    name: Test (React 18)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Downgrade React to 18
+        run: yarn add -D react@^18.3.1 react-dom@^18.3.1 @types/react@^18 @types/react-dom@^18
+
+      - name: Test
+        run: yarn test

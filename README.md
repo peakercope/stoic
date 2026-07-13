@@ -23,6 +23,7 @@ No reducers • No dependency arrays • No boilerplate • Fully typed • Plug
 <a href="#derived-state">Derived State</a> •
 <a href="#batching">Batching</a> •
 <a href="#plugins">Plugins</a> •
+<a href="#per-instance-stores">Per-instance Stores</a> •
 <a href="#faq">FAQ</a>
 </p>
 
@@ -89,12 +90,12 @@ export const cart = createStore<State, Derived>({
 });
 
 export const { setTax, addItem } = cart.actions({
-  setTax: (setState, tax: number) => {
-    setState({ tax });
+  setTax: ({ set }, tax: number) => {
+    set({ tax });
   },
 
-  addItem: (setState, item: CartItem) => {
-    setState((s) => ({
+  addItem: ({ set }, item: CartItem) => {
+    set((s) => ({
       items: [...s.items, item],
     }));
   },
@@ -187,17 +188,21 @@ Actions update the store. Instead of dispatching action objects, you call a plai
 setTax(0.15);
 ```
 
-Every action receives `setState` as its first argument, followed by whatever arguments you call it with. `setState` accepts either a partial state object or an updater function that reads the current state:
+Every action receives a context as its first argument, followed by whatever arguments you call it with. The context has two members:
+
+* `set` — updates state. Accepts either a partial state object or an updater function that reads the current state.
+* `get` — returns the current state (including derived values), useful for reading mid-action.
 
 ```tsx
 const { addItem, removeItem, clearCart } = cart.actions({
-  addItem: (setState, item: CartItem) => {
-    setState((s) => ({ items: [...s.items, item] }));
-  removeItem: (setState, id: number) => {
-    setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+  addItem: ({ set }, item: CartItem) => {
+    set((s) => ({ items: [...s.items, item] }));
   },
-  clearCart: (setState) => {
-    setState({ items: [] });
+  removeItem: ({ set }, id: number) => {
+    set((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+  },
+  clearCart: ({ set }) => {
+    set({ items: [] });
   },
 });
 ```
@@ -208,7 +213,7 @@ Action arguments and store state are both fully typed, so your editor infers the
 
 ## Async Actions
 
-An action can be asynchronous — just make the function `async` and call `setState` whenever you have new data:
+An action can be asynchronous — just make the function `async` and call `set` whenever you have new data:
 
 ```tsx
 type User = { id: number; name: string };
@@ -220,10 +225,10 @@ const users = createStore<{ user: User | null }>({
 });
 
 const { loadUser } = users.actions({
-  loadUser: async (setState, id: number) => {
+  loadUser: async ({ set }, id: number) => {
     const user = await fetch(`/api/users/${id}`).then((r) => r.json());
 
-    setState({ user });
+    set({ user });
   },
 });
 ```
@@ -252,6 +257,24 @@ if (status === "error") {
 
 `status` is one of `"idle" | "pending" | "success" | "error"`.
 
+### Overlapping calls and stale responses
+
+Stoic does not cancel async work. If the same action is called again while a previous call is still in flight, **both** calls' `set`s land — the slower response can overwrite the faster one. The meta status always reflects the *most recent* call, but state writes are on you. Use `get` to drop a stale result:
+
+```tsx
+const { selectUser } = search.actions({
+  selectUser: async ({ set, get }, login: string) => {
+    set({ selected: login });
+    const profile = await api.fetchProfile(login);
+
+    // Another user was selected while this fetch was in flight — drop it.
+    if (get().selected !== login) return;
+
+    set({ profile });
+  },
+});
+```
+
 ---
 
 ## Derived State
@@ -272,10 +295,13 @@ derived: {
 
 Every component that reads `total` gets the same computed value, and it's recomputed only when `subtotal` or `tax` actually change — not on every render, and not on unrelated state changes.
 
-Derived values can depend on each other, too. Extending the cart example with a discount:
+Derived values can depend on each other, too. Extending the cart example with a discount (note the two type parameters — `createStore<State, Derived>` — which derived stores need; see [TypeScript](#typescript) below):
 
 ```tsx
-const cart = createStore({
+type State = { items: CartItem[]; tax: number; discount: number };
+type Derived = { subtotal: number; total: number; finalPrice: number };
+
+const cart = createStore<State, Derived>({
   state: {
     items: [],
     tax: 0.2,
@@ -292,61 +318,73 @@ const cart = createStore({
 
 Stoic builds a dependency graph from this: `items → subtotal → total → finalPrice`, with `tax` feeding into `total` and `discount` feeding into `finalPrice`. When state changes, only the derived values downstream of that change are recomputed:
 
-| setDiscount(0.2) || setTax(0.25) |
-| :---: |:-:| :---: |
-| ❌ || ❌ |
-| *subtotal* (unchanged) || *subtotal* (unchanged) |
-| ❌ || ✅ |
-| *total* (unchanged) || *total* (recomputed) |
-| ✅ || ✅ |
-| *finalPrice* (recomputed) || *finalPrice* (recomputed) |
-
+| After…            | `subtotal`      | `total`         | `finalPrice`  |
+| ----------------- | --------------- | --------------- | ------------- |
+| `setDiscount(0.2)` | ❌ not recomputed | ❌ not recomputed | ✅ recomputed |
+| `setTax(0.25)`     | ❌ not recomputed | ✅ recomputed    | ✅ recomputed |
 
 There are no dependency arrays to maintain and nothing to memoize by hand — Stoic tracks which state each derived value reads and invalidates only what's affected.
 
-> Derived values are recomputed in declaration order, in a single pass — not resolved as a dependency graph at runtime. If a derived key reads another derived key, it must be declared *after* it (as `total` is declared after `subtotal` above), or it will see a stale value. 
+### What dependency tracking sees
 
-> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` rather than looping forever.
+Tracking is **per top-level state key**. A derived function that reads `s.items` depends on the `items` *reference* — Stoic does not watch inside arrays or objects. Two rules follow:
+
+1. **Update state immutably.** Mutating an array in place (`s.items.push(...)`) keeps the same reference, so nothing downstream recomputes. Every example in this README produces a new array/object instead.
+2. **Read inputs as properties** (`s.count`); dependency tracking doesn't see `Object.keys(s)` or `"count" in s`.
+
+Derived values are computed **lazily**: a derived key does its work the first time it's read after a relevant change, and the result is memoized until a dependency actually changes. Declaration order doesn't matter — a derived key can freely read another derived key declared before or after it; reads resolve recursively through the dependency graph. (The one exception to laziness: every derived key is evaluated once at store creation, so a statically cyclic configuration fails immediately.)
+
+> Derived functions should be **pure** — no side effects, no reading clocks or randomness. An impure derived value only recomputes when its tracked dependencies change, so anything else it reads goes stale silently.
+
+> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle — at store creation if the cycle is always present, or on the read of the cyclic value if it only appears for certain states.
+
+---
+
+## TypeScript
+
+State-only stores infer everything from the config object. Stores with **derived state need both type parameters spelled out** — `createStore<State, Derived>` — because a derived function's argument includes the derived values themselves, which TypeScript cannot infer while it is still inferring them:
+
+```tsx
+type State = { count: number };
+type Derived = { doubled: number };
+
+const store = createStore<State, Derived>({
+  state: { count: 1 },
+  derived: { doubled: (s) => s.count * 2 },
+});
+```
+
+Everything downstream — `useStore` selectors, action arguments, `get()` inside actions — is inferred from there; no further annotations are needed. The types you may want to import: `StoicStore<State, Full>` to pass a store around, `SetState`, `ActionCtx`, and `StoicPlugin` to write plugins.
 
 ---
 
 ## Batching
 
-Every `setState` call — whether direct or made from inside an action — recomputes derived state and notifies components immediately. Calling three actions in a row means three recomputes and three rerenders. Wrap them in `batch`, from `stoic-store/tools`, to coalesce all of it into a single recompute and a single rerender:
+Every `setState` call that changes something — whether direct or made from inside an action — notifies components immediately. Calling three actions in a row means three rerenders. Wrap them in `store.batch` to coalesce them into a single notification and a single rerender:
 
 ```tsx
-import { batch } from "stoic-store/tools";
-
 const store = createStore({
   state: { name: "", age: 0, country: "" },
 });
 
 const { setName, setAge, setCountry } = store.actions({
-  setName: (setState, name: string) => setState({ name }),
-  setAge: (setState, age: number) => setState({ age }),
-  setCountry: (setState, country: string) => setState({ country }),
+  setName: ({ set }, name: string) => set({ name }),
+  setAge: ({ set }, age: number) => set({ age }),
+  setCountry: ({ set }, country: string) => set({ country }),
 });
 
-batch(store, () => {
+store.batch(() => {
   setName("John");
   setAge(30);
   setCountry("USA");
 });
 ```
 
-`batch` also works with async actions — pass an async function and `await` the result:
+Everything called inside the callback — direct `setState` calls, actions, or both — updates state immediately but defers the notification until the outermost batch closes. If the callback throws, pending changes are kept and listeners are still notified once before the error propagates. A batch that changes nothing notifies no one.
 
-```tsx
-await batch(store, async () => {
-  await loadUser();
-  await loadPosts();
-  await loadSettings();
-});
-```
+Reads made *during* a batch (e.g. `store.getState()` from inside another action) always see fully consistent state — raw and derived values agree at every point.
 
-Everything called inside the callback — direct `setState` calls, actions, or both — is deferred until the batch closes, whether the callback is sync or async. If it throws or its returned promise rejects, pending changes are still flushed and listeners still notified once before the error propagates.
-
-> Reads made *during* a batch (e.g. `store.getState()` from inside another action) see up-to-date raw state but stale derived values — derived state only recomputes once the batch closes. This mirrors how React itself batches `setState` calls.
+> `batch` is synchronous: the batch ends when the callback returns, so `async` work inside the callback isn't deferred past the first `await`. Batch each synchronous chunk of an async flow instead.
 
 ---
 
@@ -411,9 +449,10 @@ Refresh the page and `settings` is restored automatically. `persist` accepts:
 | `serialize` | `(state) => string` | `JSON.stringify` | Custom serialization. |
 | `deserialize` | `(raw) => Partial<T>` | `JSON.parse` | Custom deserialization. |
 | `debounceMs` | `number` | — | Delay writes, resetting the timer on each change. |
-| `throttleMs` | `number` | — | Limit writes to at most once per interval. |
+| `version` | `number` | — | Schema version of the persisted state (see below). |
+| `migrate` | `(persisted, version) => Partial<T>` | — | Upgrade an older payload to the current shape. |
 
-`include` and `exclude` are mutually exclusive, as are `debounceMs` and `throttleMs`. Pending debounced or throttled writes are flushed immediately if the store is destroyed.
+`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed.
 
 ```tsx
 persist({
@@ -422,6 +461,28 @@ persist({
   debounceMs: 250,               // batch rapid updates into one write
 });
 ```
+
+#### Versioning and migrations
+
+State shapes change between releases. Set `version`, and when a stored payload was written by an older version, `migrate` receives it (as deserialized) together with the version that wrote it and returns state in the current shape:
+
+```tsx
+persist<Settings>({
+  key: "settings",
+  version: 2,
+  migrate: (persisted, version) => {
+    const old = persisted as Record<string, unknown>;
+    if (version < 2) {
+      // v1 stored a single `name`; v2 splits it.
+      const [firstName = "", lastName = ""] = String(old.name ?? "").split(" ");
+      return { firstName, lastName };
+    }
+    return old as Partial<Settings>;
+  },
+});
+```
+
+With `version` set, payloads are stored as a `{ version, state }` envelope. A payload written before versioning was enabled is treated as version `0`. If the versions differ and no `migrate` is provided, the stored state is discarded (with a console warning) rather than hydrated into the wrong shape.
 
 #### Derived state is never persisted
 
@@ -437,8 +498,12 @@ A plugin is an object implementing any of the `StoicPlugin` lifecycle hooks. Hoo
 
 * `onInit(store)` — called once when the store is created.
 * `beforeAction(ctx)` / `afterAction(ctx)` — called around every action call, with `{ name, args, state }`. `afterAction` still runs if the action throws or rejects.
-* `beforeSetState(partial)` / `afterSetState(state)` — called around every `setState`, with the raw partial update and the full merged state respectively. During a [`batch`](#batching), `afterSetState` fires once when the batch closes rather than once per `setState` call — so `persist` writes once and `devtools` logs one combined entry per batch.
+* `afterSetState(state, actionName?)` — called after every update that changed something, with the full merged state. `actionName` is the name of the action whose `set` produced the change (correct even across `await`s and overlapping async actions), or `undefined` for a direct `store.setState`. During a [`batch`](#batching), the hook fires once when the batch closes — so `persist` writes once and `devtools` logs one combined entry per batch.
 * `onDestroy()` — called when `store.destroy()` is called.
+
+> Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as derived state instead.
+
+A plugin that needs to tell raw state apart from derived values (as `persist` does) can inspect the snapshot: derived keys are exposed as enumerable getter properties, raw keys as plain data properties — `Object.getOwnPropertyDescriptor(store.getState(), key)?.get` is set exactly for derived keys, and checking it doesn't trigger any computation.
 
 ```tsx
 const logger = (): StoicPlugin => ({
@@ -454,6 +519,75 @@ const store = createStore({
 ```
 
 > **Note:** Define hooks with method shorthand (`afterSetState(state) { ... }`), not as arrow-function properties (`afterSetState: (state) => { ... }`). Both run the same way, but method shorthand is required for the hook to type-check correctly against stores with derived state.
+
+---
+
+## Per-instance stores
+
+Everything above creates the store at module level — one store per JavaScript process. In the browser that's exactly right, and it's the pattern you should reach for by default.
+
+It breaks down when **one process serves several independent trees**:
+
+* **Server rendering.** An SSR server is long-lived and handles many users concurrently. A module-level store is shared by every request, so one user's state can leak into another user's render.
+* **Repeated widgets.** Two instances of the same component that each need their own store.
+* **Tests.** Each test wants a clean store, without resetting a shared one.
+
+`createStoreContext` builds a React Context around a store factory, so each mounted `Provider` gets its own store:
+
+```tsx
+import { createStore, createStoreContext } from "stoic-store";
+
+export const { Provider, useStore, useActions, useStoreApi } = createStoreContext(
+  (initialItems: CartItem[] = []) => {
+    const store = createStore<CartState, CartDerived>({
+      state: { items: initialItems, tax: 0.2 },
+      derived: {
+        subtotal: ({ items }) => items.reduce((sum, item) => sum + item.price, 0),
+        total: ({ subtotal, tax }) => subtotal * (1 + tax),
+      },
+    });
+
+    const actions = store.actions({
+      addItem: ({ set }, item: CartItem) => set((s) => ({ items: [...s.items, item] })),
+      loadCart: async ({ set }) => set({ items: await fetchCart() }),
+    });
+
+    return { store, actions };
+  },
+);
+```
+
+The factory returns **both** the store and its actions. Action handles close over the store they were created from, so they have to be built per instance — doing it here binds them once and keeps their identity, and their `useMeta` status, stable across renders.
+
+Wrap the tree in the `Provider`, optionally seeding it with `init`:
+
+```tsx
+<Provider init={itemsFetchedOnTheServer}>
+  <Cart />
+</Provider>
+```
+
+Components then read and act through the returned hooks, with the same ergonomics as the singleton API:
+
+```tsx
+function CartSummary() {
+  const total = useStore((state) => state.total);
+  const { addItem, loadCart } = useActions();
+  const { status } = loadCart.useMeta();
+
+  if (status === "pending") return <Spinner />;
+  return <button onClick={() => addItem(monitor)}>Total: ${total}</button>;
+}
+```
+
+| Returned | What it is |
+| --- | --- |
+| `Provider` | Creates one store per mount. `init` is read on the first render only — like a `defaultValue`, changing it later won't rebuild the store. |
+| `useStore(selector?, equality?)` | Identical to `store.useStore`, resolved from context. |
+| `useActions()` | This instance's action handles. Stable across renders. |
+| `useStoreApi()` | The `StoicStore` itself, for `getState` / `subscribe` / `batch` outside of render. |
+
+The store is destroyed when its `Provider` unmounts, so plugins get their `onDestroy` (a pending debounced `persist` write is flushed). This is StrictMode-safe: React's mount → unmount → mount cycle in development does not tear down the store.
 
 ---
 
@@ -493,9 +627,15 @@ export const settings = createStore(/* ... */);
 
 Yes, but `useStore` relies on `useSyncExternalStore`, a hook — so any component that calls it needs the `"use client"` directive, the same requirement as every other React state library.
 
+### Can I use module-level stores with server-side rendering?
+
+Only for request-independent data. A store created at module level is a **singleton per JavaScript process**. In the browser that's exactly what you want; on an SSR server it means every request shares the same store, so one user's state can leak into another's render.
+
+If you render on the server and put per-user data in a store, create it per request with [`createStoreContext`](#per-instance-stores) instead.
+
 ### What happens if my derived values depend on each other in a cycle?
 
-Stoic throws a `CircularDependencyError` describing the cycle, instead of recomputing forever. See [Derived State](#derived-state) for the declaration-order rule that avoids this in the first place.
+Stoic throws a `CircularDependencyError` describing the cycle, instead of recomputing forever — at store creation when the cycle is always present, or on the read of the cyclic value when it only appears for certain states.
 
 ---
 

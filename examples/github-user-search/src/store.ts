@@ -61,28 +61,32 @@ export const search = createStore<SearchState, SearchDerived>({
 });
 
 export const { findUsers, selectUser, setSort, setLanguage, setHideForks } = search.actions({
-  findUsers: async (setState, query: string) => {
+  findUsers: async ({ set }, query: string) => {
     const trimmed = query.trim();
     if (!trimmed) {
-      setState({ results: [] });
+      set({ results: [] });
       return;
     }
-    setState({ results: await api.searchUsers(trimmed) });
+    set({ results: await api.searchUsers(trimmed) });
   },
 
-  // Profile and repos are fetched together, then land in a single setState —
+  // Profile and repos are fetched together, then land in a single set —
   // one recompute, one render, no half-loaded UI.
-  selectUser: async (setState, login: string) => {
-    setState({ selected: login, profile: null, repos: [], language: null });
+  selectUser: async ({ set, get }, login: string) => {
+    set({ selected: login, profile: null, repos: [], language: null });
 
     const [profile, repos] = await Promise.all([api.fetchProfile(login), api.fetchRepos(login)]);
 
-    setState({ profile, repos });
+    // Guard against a stale response: if another user was selected while this
+    // fetch was in flight, the newer selection wins and this result is dropped.
+    if (get().selected !== login) return;
+
+    set({ profile, repos });
   },
 
-  setSort: (setState, sort: SortKey) => setState({ sort }),
+  setSort: ({ set }, sort: SortKey) => set({ sort }),
 
-  setLanguage: (setState, language: string | null) => setState({ language }),
+  setLanguage: ({ set }, language: string | null) => set({ language }),
 
-  setHideForks: (setState, hideForks: boolean) => setState({ hideForks }),
+  setHideForks: ({ set }, hideForks: boolean) => set({ hideForks }),
 });

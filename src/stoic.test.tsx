@@ -2,12 +2,7 @@ import { act } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import {
-  CircularDependencyError,
-  createStore,
-  type SetState,
-  type StoicPlugin,
-} from "../src/stoic";
+import { CircularDependencyError, createStore, type StoicPlugin } from "../src/stoic";
 import { shallow } from "./tools/shallow";
 
 // ─── Core store (no React) ────────────────────────────────────────────────────
@@ -192,10 +187,10 @@ describe("derived", () => {
 
     setState({ price: 200 });
 
+    expect(getState().finalPrice).toBeCloseTo(200 * (1 + 0.1) * (1 - 0.05));
     expect(subtotal).toHaveBeenCalledTimes(1);
     expect(total).toHaveBeenCalledTimes(1);
     expect(finalPrice).toHaveBeenCalledTimes(1);
-    expect(getState().finalPrice).toBeCloseTo(200 * (1 + 0.1) * (1 - 0.05));
   });
 
   it("only recomputes the directly-dependent derived value for a leaf field change", () => {
@@ -204,7 +199,7 @@ describe("derived", () => {
     const finalPrice = vi.fn(
       (s: { total: number; discount: number }) => s.total * (1 - s.discount),
     );
-    const { setState, subscribe } = createStore<
+    const { getState, setState, subscribe } = createStore<
       { price: number; count: number; tax: number; discount: number },
       { subtotal: number; total: number; finalPrice: number }
     >({
@@ -222,6 +217,7 @@ describe("derived", () => {
 
     setState({ discount: 0.1 });
 
+    expect(getState().finalPrice).toBeCloseTo(100 * (1 + 0.1) * (1 - 0.1));
     expect(subtotal).not.toHaveBeenCalled();
     expect(total).not.toHaveBeenCalled();
     expect(finalPrice).toHaveBeenCalledTimes(1);
@@ -230,7 +226,10 @@ describe("derived", () => {
   it("does not cascade when a recomputed derived value is unchanged", () => {
     const parity = vi.fn((s: { n: number }) => s.n % 2);
     const label = vi.fn((s: { parity: number }) => (s.parity === 0 ? "even" : "odd"));
-    const { setState, subscribe } = createStore<{ n: number }, { parity: number; label: string }>({
+    const { getState, setState, subscribe } = createStore<
+      { n: number },
+      { parity: number; label: string }
+    >({
       state: { n: 2 },
       derived: {
         parity: (s) => parity(s),
@@ -243,8 +242,31 @@ describe("derived", () => {
 
     setState({ n: 4 });
 
+    expect(getState().label).toBe("even");
     expect(parity).toHaveBeenCalledTimes(1);
     expect(label).not.toHaveBeenCalled();
+  });
+
+  it("exposes derived keys as enumerable getters on snapshots, raw keys as data properties", () => {
+    // Contract relied on by plugins (persist, devtools) to tell raw state
+    // apart from computed values without evaluating them.
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 3 },
+      derived: { doubled },
+    });
+    doubled.mockClear();
+
+    const snapshot = getState();
+    const derivedDesc = Object.getOwnPropertyDescriptor(snapshot, "doubled");
+    const rawDesc = Object.getOwnPropertyDescriptor(snapshot, "count");
+
+    expect(derivedDesc?.get).toBeTypeOf("function");
+    expect(derivedDesc?.enumerable).toBe(true);
+    expect(rawDesc?.get).toBeUndefined();
+    expect(rawDesc?.value).toBe(3);
+    // Inspecting descriptors must not force computation.
+    expect(doubled).not.toHaveBeenCalled();
   });
 
   it("tracks non-string (symbol) property reads on the proxied state without adding them as dependencies", () => {
@@ -265,6 +287,50 @@ describe("derived", () => {
     setState({ other: 1 });
 
     expect(doubled).not.toHaveBeenCalled();
+  });
+});
+
+describe("old-snapshot derived reads", () => {
+  it("computes at most once per snapshot when old and new snapshots are read alternately", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+
+    const before = getState();
+    setState({ count: 2 });
+    const after = getState();
+
+    // Warm both snapshots once, then verify alternating reads never recompute.
+    expect(before.doubled).toBe(2);
+    expect(after.doubled).toBe(4);
+    doubled.mockClear();
+
+    expect(after.doubled).toBe(4);
+    expect(before.doubled).toBe(2);
+    expect(after.doubled).toBe(4);
+    expect(before.doubled).toBe(2);
+
+    expect(doubled).not.toHaveBeenCalled();
+  });
+
+  it("keeps a stable reference per snapshot for object-returning derived values", () => {
+    const { getState, setState } = createStore<{ n: number }, { wrapped: { n: number } }>({
+      state: { n: 1 },
+      derived: { wrapped: (s) => ({ n: s.n }) },
+    });
+
+    const before = getState();
+    setState({ n: 2 });
+    const after = getState();
+
+    const beforeRef = before.wrapped;
+    const afterRef = after.wrapped;
+    expect(before.wrapped).toBe(beforeRef);
+    expect(after.wrapped).toBe(afterRef);
+    expect(beforeRef).toEqual({ n: 1 });
+    expect(afterRef).toEqual({ n: 2 });
   });
 });
 
@@ -332,9 +398,9 @@ describe("lazy/mount-aware derived recomputation", () => {
     expect(doubled).toHaveBeenCalledTimes(1);
   });
 
-  it("recomputes eagerly on every setState once a listener is attached", () => {
+  it("computes at most once per state change no matter how often it is read", () => {
     const doubled = vi.fn((s: { count: number }) => s.count * 2);
-    const { setState, subscribe } = createStore<{ count: number }, { doubled: number }>({
+    const { getState, setState, subscribe } = createStore<{ count: number }, { doubled: number }>({
       state: { count: 1 },
       derived: { doubled },
     });
@@ -342,9 +408,12 @@ describe("lazy/mount-aware derived recomputation", () => {
     doubled.mockClear();
 
     setState({ count: 2 });
+    expect(getState().doubled).toBe(4);
+    expect(getState().doubled).toBe(4);
     expect(doubled).toHaveBeenCalledTimes(1);
 
     setState({ count: 3 });
+    expect(getState().doubled).toBe(6);
     expect(doubled).toHaveBeenCalledTimes(2);
   });
 
@@ -364,40 +433,40 @@ describe("lazy/mount-aware derived recomputation", () => {
     expect(getState().doubled).toBe(18);
   });
 
-  it("a plugin implementing afterSetState forces eager recomputation with no listeners", () => {
+  it("an afterSetState plugin can read fresh derived values from the snapshot it receives", () => {
     const doubled = vi.fn((s: { count: number }) => s.count * 2);
-    const afterSetState = vi.fn();
+    const seen: number[] = [];
     const { setState } = createStore<{ count: number }, { doubled: number }>({
       state: { count: 1 },
       derived: { doubled },
-      plugins: [{ afterSetState }],
+      plugins: [{ afterSetState: (s) => seen.push((s as { doubled: number }).doubled) }],
     });
     doubled.mockClear();
-    afterSetState.mockClear();
 
     setState({ count: 2 });
 
+    expect(seen).toEqual([4]);
     expect(doubled).toHaveBeenCalledTimes(1);
-    expect(afterSetState).toHaveBeenCalledWith(expect.objectContaining({ count: 2, doubled: 4 }));
   });
 
-  it("a plugin without afterSetState does not force eager recomputation", () => {
+  it("an afterSetState plugin that does not read derived values does not trigger computation", () => {
     const doubled = vi.fn((s: { count: number }) => s.count * 2);
-    const onDestroy = vi.fn();
+    const afterSetState = vi.fn();
     const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
       state: { count: 1 },
       derived: { doubled },
-      plugins: [{ onDestroy }],
+      plugins: [{ afterSetState: () => afterSetState() }],
     });
     doubled.mockClear();
 
     setState({ count: 2 });
 
+    expect(afterSetState).toHaveBeenCalledTimes(1);
     expect(doubled).not.toHaveBeenCalled();
     expect(getState().doubled).toBe(4);
   });
 
-  it("defers the CircularDependencyError throw to the next getState() when unobserved", () => {
+  it("surfaces a CircularDependencyError on the read of the cyclic key, not on setState", () => {
     const { getState, setState } = createStore<{ flag: boolean }, { a: number; b: number }>({
       state: { flag: false },
       derived: {
@@ -407,7 +476,7 @@ describe("lazy/mount-aware derived recomputation", () => {
     });
 
     expect(() => setState({ flag: true })).not.toThrow();
-    expect(() => getState()).toThrow(new CircularDependencyError(["a", "b", "a"]));
+    expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 });
 
@@ -451,8 +520,11 @@ describe("circular dependency detection", () => {
     expect(create).toThrow(new CircularDependencyError(["a", "a"]));
   });
 
-  it("throws once a cycle only manifests via a later setState, observed by a listener", () => {
-    const { setState, subscribe } = createStore<{ flag: boolean }, { a: number; b: number }>({
+  it("throws on read once a cycle only manifests via a later setState", () => {
+    const { getState, setState, subscribe } = createStore<
+      { flag: boolean },
+      { a: number; b: number }
+    >({
       state: { flag: false },
       derived: {
         a: (s) => (s.flag ? s.b + 1 : 0),
@@ -460,8 +532,9 @@ describe("circular dependency detection", () => {
       },
     });
     subscribe(vi.fn());
+    setState({ flag: true });
 
-    expect(() => setState({ flag: true })).toThrow(new CircularDependencyError(["a", "b", "a"]));
+    expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 
   it("does not throw for a non-cyclic diamond of dependencies", () => {
@@ -482,11 +555,68 @@ describe("circular dependency detection", () => {
 
 // ─── action ───────────────────────────────────────────────────────────────────
 
+describe("action context", () => {
+  it("provides get for reading current state inside an action", () => {
+    const store = createStore({ state: { count: 5, snapshot: 0 } });
+    const { record } = store.actions({
+      record: ({ set, get }) => set({ snapshot: get().count }),
+    });
+
+    record();
+
+    expect(store.getState().snapshot).toBe(5);
+  });
+
+  it("get reflects earlier writes within the same action", () => {
+    const store = createStore({ state: { count: 1, seen: 0 } });
+    const { bump } = store.actions({
+      bump: ({ set, get }) => {
+        set({ count: 10 });
+        set({ seen: get().count });
+      },
+    });
+
+    bump();
+
+    expect(store.getState().seen).toBe(10);
+  });
+
+  it("get reads fresh state after an await in an async action", async () => {
+    const store = createStore({ state: { count: 1, seen: 0 } });
+    const { probe } = store.actions({
+      probe: async ({ set, get }) => {
+        await Promise.resolve();
+        set({ seen: get().count });
+      },
+    });
+
+    const promise = probe();
+    store.setState({ count: 42 });
+    await promise;
+
+    expect(store.getState().seen).toBe(42);
+  });
+
+  it("get sees derived values", () => {
+    const store = createStore<{ count: number; copy: number }, { doubled: number }>({
+      state: { count: 3, copy: 0 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+    const { snap } = store.actions({
+      snap: ({ set, get }) => set({ copy: get().doubled }),
+    });
+
+    snap();
+
+    expect(store.getState().copy).toBe(6);
+  });
+});
+
 describe("action", () => {
   it("sync action updates state", () => {
     const { getState, actions } = createStore({ state: { count: 0 } });
     const { inc } = actions({
-      inc: (setState) => setState((s) => ({ count: s.count + 1 })),
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
     });
     inc();
     expect(getState().count).toBe(1);
@@ -497,7 +627,7 @@ describe("action", () => {
       state: { count: 5 },
     });
     const { inc } = actions({
-      inc: (setState) => setState((s) => ({ count: s.count + 1 })),
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
     });
     setState({ count: 10 });
     inc();
@@ -507,7 +637,7 @@ describe("action", () => {
   it("sync action supports extra arguments", () => {
     const { getState, actions } = createStore({ state: { count: 0 } });
     const { add } = actions({
-      add: (setState, amount: number) => setState((s) => ({ count: s.count + amount })),
+      add: ({ set }, amount: number) => set((s) => ({ count: s.count + amount })),
     });
     add(5);
     expect(getState().count).toBe(5);
@@ -520,7 +650,7 @@ describe("action", () => {
     const listener = vi.fn();
     subscribe(listener);
     const { inc } = actions({
-      inc: (setState) => setState((s) => ({ count: s.count + 1 })),
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
     });
     inc();
     expect(listener).toHaveBeenCalledOnce();
@@ -532,10 +662,10 @@ describe("action", () => {
       state: { loading: false, value: "" },
     });
     const { load } = actions({
-      load: async (setState: SetState<{ loading: boolean; value: string }>) => {
-        setState({ loading: true });
+      load: async ({ set }) => {
+        set({ loading: true });
         await Promise.resolve();
-        setState({ loading: false, value: "done" });
+        set({ loading: false, value: "done" });
       },
     });
     await load();
@@ -546,9 +676,9 @@ describe("action", () => {
   it("async action supports extra arguments", async () => {
     const { getState, actions } = createStore({ state: { value: 0 } });
     const { setTo } = actions({
-      setTo: async (setState: SetState<{ value: number }>, n: number) => {
+      setTo: async ({ set }, n: number) => {
         await Promise.resolve();
-        setState({ value: n });
+        set({ value: n });
       },
     });
     await setTo(42);
@@ -558,8 +688,8 @@ describe("action", () => {
   it("async action returns a promise", () => {
     const { actions } = createStore({ state: { done: false } });
     const { run } = actions({
-      run: async (setState: SetState<{ done: boolean }>) => {
-        setState({ done: true });
+      run: async ({ set }) => {
+        set({ done: true });
       },
     });
     expect(run()).toBeInstanceOf(Promise);
@@ -570,10 +700,10 @@ describe("action", () => {
     const steps: number[] = [];
     subscribe((s) => steps.push(s.step));
     const { run } = actions({
-      run: async (setState: SetState<{ step: number }>) => {
-        setState({ step: 1 });
+      run: async ({ set }) => {
+        set({ step: 1 });
         await Promise.resolve();
-        setState({ step: 2 });
+        set({ step: 2 });
       },
     });
     await run();
@@ -583,7 +713,7 @@ describe("action", () => {
   it("new action starts with idle status and no error", () => {
     const { actions } = createStore({ state: { count: 0 } });
     const { inc } = actions({
-      inc: (setState) => setState((s) => ({ count: s.count + 1 })),
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
     });
     expect(inc.getMeta()).toEqual({ status: "idle", error: undefined });
   });
@@ -591,7 +721,7 @@ describe("action", () => {
   it("sync action reaches success status after completing", () => {
     const { actions } = createStore({ state: { count: 0 } });
     const { inc } = actions({
-      inc: (setState) => setState((s) => ({ count: s.count + 1 })),
+      inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
     });
     inc();
     expect(inc.getMeta()).toEqual({ status: "success", error: undefined });
@@ -615,9 +745,9 @@ describe("action", () => {
     const { actions } = createStore({ state: { value: "" } });
     const seen: string[] = [];
     const { load } = actions({
-      load: async (setState: SetState<{ value: string }>) => {
+      load: async ({ set }) => {
         await Promise.resolve();
-        setState({ value: "done" });
+        set({ value: "done" });
       },
     });
     load.subscribeMeta((meta) => seen.push(meta.status));
@@ -632,9 +762,9 @@ describe("action", () => {
     const { actions } = createStore({ state: { value: "" } });
     const seen: string[] = [];
     const { load } = actions({
-      load: async (setState: SetState<{ value: string }>) => {
+      load: async ({ set }) => {
         await Promise.resolve();
-        setState({ value: "done" });
+        set({ value: "done" });
       },
     });
     load.subscribeMeta((meta) => seen.push(meta.status));
@@ -667,22 +797,38 @@ describe("action", () => {
 // ─── plugins ──────────────────────────────────────────────────────────────────
 
 describe("plugins", () => {
-  it("calls onInit once with the store", () => {
+  it("calls onInit once with the store as its only argument", () => {
     const onInit = vi.fn();
     const plugin: StoicPlugin<{ count: number }> = { onInit };
-    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 0 },
+      derived: { doubled: (s) => s.count * 2 },
+      plugins: [plugin as StoicPlugin<{ count: number }, { count: number; doubled: number }>],
+    });
     expect(onInit).toHaveBeenCalledOnce();
+    expect(onInit.mock.calls[0]).toHaveLength(1);
     expect(onInit).toHaveBeenCalledWith(
       expect.objectContaining({ getState: expect.any(Function) }),
     );
-    expect(onInit.mock.calls[0]?.[0].getState()).toEqual({ count: 0 });
+    expect(onInit.mock.calls[0]?.[0].getState()).toEqual({
+      count: 0,
+      doubled: 0,
+    });
     store.destroy();
   });
 
-  it("calls beforeSetState with the raw partial and afterSetState with merged state", () => {
+  it("keeps derived keys off the public store object", () => {
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 0 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+    expect("derivedKeys" in store).toBe(false);
+    store.destroy();
+  });
+
+  it("calls afterSetState with the merged state", () => {
     const calls: string[] = [];
     const plugin: StoicPlugin<{ count: number; name: string }> = {
-      beforeSetState: (next) => calls.push(`before:${JSON.stringify(next)}`),
       afterSetState: (state) => calls.push(`after:${JSON.stringify(state)}`),
     };
     const store = createStore({
@@ -690,7 +836,7 @@ describe("plugins", () => {
       plugins: [plugin],
     });
     store.setState({ count: 1 });
-    expect(calls).toEqual(['before:{"count":1}', 'after:{"count":1,"name":"stoic"}']);
+    expect(calls).toEqual(['after:{"count":1,"name":"stoic"}']);
     store.destroy();
   });
 
@@ -702,7 +848,7 @@ describe("plugins", () => {
     };
     const store = createStore({ state: { count: 0 }, plugins: [plugin] });
     const { inc } = store.actions({
-      inc: (setState, by: number) => setState((s) => ({ count: s.count + by })),
+      inc: ({ set }, by: number) => set((s) => ({ count: s.count + by })),
     });
     inc(5);
     expect(calls).toEqual([
@@ -720,8 +866,8 @@ describe("plugins", () => {
     };
     const store = createStore({ state: { count: 0 }, plugins: [plugin] });
     const { inc, dec } = store.actions({
-      inc: (setState, by: number) => setState((s) => ({ count: s.count + by })),
-      dec: (setState, by: number) => setState((s) => ({ count: s.count - by })),
+      inc: ({ set }, by: number) => set((s) => ({ count: s.count + by })),
+      dec: ({ set }, by: number) => set((s) => ({ count: s.count - by })),
     });
     inc(5);
     dec(2);
@@ -742,9 +888,9 @@ describe("plugins", () => {
     };
     const store = createStore({ state: { value: "" }, plugins: [plugin] });
     const { load } = store.actions({
-      load: async (setState: SetState<{ value: string }>) => {
+      load: async ({ set }) => {
         await Promise.resolve();
-        setState({ value: "done" });
+        set({ value: "done" });
       },
     });
     await load();
@@ -943,6 +1089,34 @@ describe("useStore", () => {
     hook.unmount();
   });
 
+  it("re-reads through a selector that changes between renders", () => {
+    const store = createStore({ state: { a: 1, b: 2 } });
+    let latest = 0;
+
+    function Component({ which }: { which: "a" | "b" }) {
+      latest = store.useStore((s) => s[which]);
+      return null;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<Component which="a" />));
+    expect(latest).toBe(1);
+
+    act(() => root.render(<Component which="b" />));
+    expect(latest).toBe(2);
+
+    // The new selector must also keep tracking store updates.
+    act(() => {
+      store.setState({ b: 20 });
+    });
+    expect(latest).toBe(20);
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
   it("does not re-render children when a change only touches unrelated derived values", () => {
     // Mirrors the shopping-cart example: a parent selects `items` plus a derived
     // count, while an unrelated raw key feeds a *different* derived value. The
@@ -1020,7 +1194,9 @@ describe("useStore SSR", () => {
   });
 
   it("caches the server snapshot so object-literal selectors can hydrate", () => {
-    const store = createStore({ state: { count: 42, label: "server", other: 0 } });
+    const store = createStore({
+      state: { count: 42, label: "server", other: 0 },
+    });
 
     function Component() {
       const { count, label } = store.useStore((s) => ({ count: s.count, label: s.label }), shallow);
@@ -1061,9 +1237,9 @@ describe("useMeta", () => {
   it("re-renders through pending, then success", async () => {
     const store = createStore({ state: { value: "" } });
     const { load } = store.actions({
-      load: async (setState: SetState<{ value: string }>) => {
+      load: async ({ set }) => {
         await Promise.resolve();
-        setState({ value: "done" });
+        set({ value: "done" });
       },
     });
     const hook = renderHook(() => load.useMeta());
@@ -1135,6 +1311,279 @@ describe("shallow", () => {
   });
 });
 
+// ─── pull-based derived engine ────────────────────────────────────────────────
+
+describe("derived declaration order", () => {
+  it("resolves a derivation reading a later-declared derived key", () => {
+    const { getState, setState } = createStore<
+      { n: number },
+      { quadruple: number; double: number }
+    >({
+      state: { n: 1 },
+      derived: {
+        quadruple: (s) => s.double * 2,
+        double: (s) => s.n * 2,
+      },
+    });
+    expect(getState().quadruple).toBe(4);
+
+    setState({ n: 5 });
+    expect(getState().double).toBe(10);
+    expect(getState().quadruple).toBe(20);
+  });
+
+  it("resolves a 3-deep chain declared in reverse order", () => {
+    const { getState, setState } = createStore<{ n: number }, { c: number; b: number; a: number }>({
+      state: { n: 1 },
+      derived: {
+        c: (s) => s.b + 1,
+        b: (s) => s.a + 1,
+        a: (s) => s.n + 1,
+      },
+    });
+    expect(getState().c).toBe(4);
+    setState({ n: 10 });
+    expect(getState().c).toBe(13);
+  });
+});
+
+describe("cycle detection on every read", () => {
+  it("throws on every read of a cyclic derived key, not just the first", () => {
+    const { getState, setState } = createStore<{ flag: boolean }, { a: number; b: number }>({
+      state: { flag: false },
+      derived: {
+        a: (s) => (s.flag ? s.b + 1 : 0),
+        b: (s) => (s.flag ? s.a + 1 : 0),
+      },
+    });
+
+    setState({ flag: true });
+    expect(() => getState().a).toThrow(CircularDependencyError);
+    expect(() => getState().a).toThrow(CircularDependencyError);
+    expect(() => getState().b).toThrow(CircularDependencyError);
+  });
+
+  it("recovers with correct values once the cycle is removed", () => {
+    const { getState, setState } = createStore<
+      { flag: boolean; n: number },
+      { a: number; b: number }
+    >({
+      state: { flag: false, n: 1 },
+      derived: {
+        a: (s) => (s.flag ? s.b + 1 : s.n),
+        b: (s) => (s.flag ? s.a + 1 : s.n * 10),
+      },
+    });
+
+    setState({ flag: true });
+    expect(() => getState().a).toThrow(CircularDependencyError);
+
+    setState({ flag: false, n: 2 });
+    expect(getState().a).toBe(2);
+    expect(getState().b).toBe(20);
+  });
+});
+
+describe("store.batch", () => {
+  it("notifies listeners once for multiple setState calls", () => {
+    const store = createStore({ state: { count: 0 } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.batch(() => {
+      store.setState({ count: 1 });
+      store.setState((s) => ({ count: s.count + 1 }));
+      store.setState((s) => ({ count: s.count + 1 }));
+    });
+
+    expect(store.getState().count).toBe(3);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("getState inside a batch is internally consistent (raw and derived agree)", () => {
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+    store.subscribe(vi.fn());
+
+    store.batch(() => {
+      store.setState({ count: 10 });
+      const s = store.getState();
+      expect(s.count).toBe(10);
+      expect(s.doubled).toBe(20);
+    });
+
+    expect(store.getState().doubled).toBe(20);
+  });
+
+  it("does not flush until the outermost of nested batch calls ends", () => {
+    const store = createStore({ state: { count: 0 } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.batch(() => {
+      store.setState({ count: 1 });
+      store.batch(() => {
+        store.setState({ count: 2 });
+      });
+      expect(listener).not.toHaveBeenCalled();
+      store.setState({ count: 3 });
+    });
+
+    expect(store.getState().count).toBe(3);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("still notifies once if the callback throws after a setState", () => {
+    const store = createStore({ state: { count: 0 } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    expect(() =>
+      store.batch(() => {
+        store.setState({ count: 1 });
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+
+    expect(store.getState().count).toBe(1);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not notify listeners when the batch performed no state change", () => {
+    const store = createStore({ state: { count: 0 } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.batch(() => {});
+    store.batch(() => {
+      store.setState({ count: 0 });
+    });
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("returns the callback's return value", () => {
+    const store = createStore({ state: { count: 0 } });
+    expect(store.batch(() => 42)).toBe(42);
+  });
+});
+
+describe("no-op setState", () => {
+  it("does not notify listeners when no key actually changed", () => {
+    const store = createStore({ state: { count: 0, name: "stoic" } });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    store.setState({ count: 0 });
+    store.setState({ count: 0, name: "stoic" });
+    store.setState({});
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("keeps the same state reference when no key actually changed", () => {
+    const store = createStore({ state: { count: 0 } });
+    const before = store.getState();
+    store.setState({ count: 0 });
+    expect(store.getState()).toBe(before);
+  });
+});
+
+describe("re-entrant updates during notification", () => {
+  it("warns in dev when a plugin updates state from afterSetState but still converges", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let store!: ReturnType<typeof createStore<{ count: number; mirror: number }>>;
+    store = createStore<{ count: number; mirror: number }>({
+      state: { count: 0, mirror: 0 },
+      plugins: [
+        {
+          afterSetState(state) {
+            if (state.mirror !== state.count) store.setState({ mirror: state.count });
+          },
+        },
+      ],
+    });
+
+    store.setState({ count: 3 });
+
+    expect(store.getState()).toEqual({ count: 3, mirror: 3 });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("re-entrant"));
+    warnSpy.mockRestore();
+  });
+
+  it("throws instead of overflowing when a listener updates state unconditionally", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore({ state: { count: 0 } });
+    store.subscribe((s) => {
+      store.setState({ count: s.count + 1 });
+    });
+
+    expect(() => store.setState({ count: 1 })).toThrow(/maximum update depth/);
+    warnSpy.mockRestore();
+  });
+});
+
+describe("prototype-named state keys", () => {
+  it("sets a state key that shadows an Object.prototype member", () => {
+    const store = createStore<{ toString: string; count: number }>({
+      state: { toString: "initial", count: 0 },
+    });
+
+    store.setState({ toString: "updated" });
+
+    expect(store.getState().toString).toBe("updated");
+  });
+});
+
+describe("setState with derived keys", () => {
+  it("ignores writes to derived keys and keeps the computed value", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 3 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+
+    store.setState({ doubled: 999 } as never);
+
+    expect(store.getState().doubled).toBe(6);
+    store.setState({ count: 5 });
+    expect(store.getState().doubled).toBe(10);
+    warn.mockRestore();
+  });
+});
+
+describe("action meta latest-call-wins", () => {
+  it("reflects the outcome of the most recent call even if an older call settles later", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    let resolveFirst!: () => void;
+    let call = 0;
+    const { load } = actions({
+      load: async () => {
+        call++;
+        if (call === 1) {
+          await new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+      },
+    });
+
+    const first = load();
+    const second = load();
+    await second;
+
+    // The newest call already succeeded; its outcome must win immediately.
+    expect(load.getMeta().status).toBe("success");
+
+    resolveFirst();
+    await first;
+    // The stale first call settling later must not overwrite the newer outcome.
+    expect(load.getMeta().status).toBe("success");
+  });
+});
+
 describe("regressions", () => {
   it("action meta stays pending while an overlapping call is still in flight", async () => {
     const { actions } = createStore({ state: { value: "" } });
@@ -1194,7 +1643,8 @@ describe("regressions", () => {
     const unsubscribe = store.subscribe(() => {});
 
     shouldThrow = true;
-    expect(() => store.setState({ count: 2 })).toThrow("boom");
+    store.setState({ count: 2 });
+    expect(() => store.getState().doubled).toThrow("boom");
 
     shouldThrow = false;
     expect(store.getState().doubled).toBe(4);

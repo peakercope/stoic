@@ -84,8 +84,8 @@ export const cart = createStore<CartState, CartDerived>({
 
 export const { addItem, removeItem, setQuantity, applyCoupon, removeCoupon, setShippingMethod } =
   cart.actions({
-    addItem: (setState, product: Product) => {
-      setState((s) => {
+    addItem: ({ set }, product: Product) => {
+      set((s) => {
         const existing = s.items.find((item) => item.id === product.id);
         if (existing) {
           return {
@@ -98,12 +98,12 @@ export const { addItem, removeItem, setQuantity, applyCoupon, removeCoupon, setS
       });
     },
 
-    removeItem: (setState, id: string) => {
-      setState((s) => ({ items: s.items.filter((item) => item.id !== id) }));
+    removeItem: ({ set }, id: string) => {
+      set((s) => ({ items: s.items.filter((item) => item.id !== id) }));
     },
 
-    setQuantity: (setState, id: string, quantity: number) => {
-      setState((s) => ({
+    setQuantity: ({ set }, id: string, quantity: number) => {
+      set((s) => ({
         items:
           quantity <= 0
             ? s.items.filter((item) => item.id !== id)
@@ -111,9 +111,9 @@ export const { addItem, removeItem, setQuantity, applyCoupon, removeCoupon, setS
       }));
     },
 
-    applyCoupon: (setState, coupon: Coupon) => setState({ coupon }),
+    applyCoupon: ({ set }, coupon: Coupon) => set({ coupon }),
 
-    removeCoupon: (setState) => setState({ coupon: null }),
+    removeCoupon: ({ set }) => set({ coupon: null }),
 
-    setShippingMethod: (setState, shippingMethod: ShippingMethod) => setState({ shippingMethod }),
+    setShippingMethod: ({ set }, shippingMethod: ShippingMethod) => set({ shippingMethod }),
   });
