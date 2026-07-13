@@ -346,8 +346,67 @@ describe("persist", () => {
     });
   });
 
+  describe("failing writes", () => {
+    it("warns on each failed write but stays active for later ones", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let failWrites = true;
+      const written: string[] = [];
+      const storage = {
+        getItem: () => null,
+        setItem: (_key: string, value: string) => {
+          if (failWrites) throw new Error("quota exceeded");
+          written.push(value);
+        },
+      } as unknown as Storage;
+
+      const store = createStore({
+        state: { n: 0 },
+        plugins: [persist<{ n: number }>({ key: "failing-storage", storage: () => storage })],
+      });
+
+      store.setState({ n: 1 });
+      store.setState({ n: 2 });
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("write"));
+
+      // Once the backend recovers (e.g. space was freed), writes resume.
+      failWrites = false;
+      store.setState({ n: 3 });
+      expect(written).toEqual([JSON.stringify({ n: 3 })]);
+
+      warnSpy.mockRestore();
+      store.destroy();
+    });
+  });
+
+  describe("unavailable storage", () => {
+    it("disables itself with a single warning instead of warning on every write", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "unavailable-storage",
+            // Mirrors `() => localStorage` on a server, where the global is undefined.
+            storage: () => {
+              throw new ReferenceError("localStorage is not defined");
+            },
+          }),
+        ],
+      });
+
+      store.setState({ count: 1 });
+      store.setState({ count: 2 });
+      store.destroy();
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("unavailable"));
+      warnSpy.mockRestore();
+    });
+  });
+
   describe("version and migrate", () => {
-    it("writes a versioned envelope when version is set", () => {
+    it("writes the state as a plain JSON value inside the envelope", () => {
       const store = createStore({
         state: { count: 0 },
         plugins: [persist<{ count: number }>({ key: "versioned-storage", version: 2 })],
@@ -355,9 +414,10 @@ describe("persist", () => {
 
       store.setState({ count: 1 });
 
+      // Not an escaped string: the envelope holds the state object directly.
       expect(JSON.parse(localStorage.getItem("versioned-storage") as string)).toEqual({
         version: 2,
-        state: JSON.stringify({ count: 1 }),
+        state: { count: 1 },
       });
       store.destroy();
     });
@@ -365,7 +425,7 @@ describe("persist", () => {
     it("rehydrates an envelope whose version matches", () => {
       localStorage.setItem(
         "versioned-match-storage",
-        JSON.stringify({ version: 3, state: JSON.stringify({ count: 9 }) }),
+        JSON.stringify({ version: 3, state: { count: 9 } }),
       );
 
       const store = createStore({
@@ -377,10 +437,28 @@ describe("persist", () => {
       store.destroy();
     });
 
+    it("rehydrates a pre-1.0 envelope whose state is an escaped JSON string", () => {
+      // Written by stoic-store <= 0.6, which double-serialized the state.
+      localStorage.setItem(
+        "versioned-legacy-envelope-storage",
+        JSON.stringify({ version: 3, state: JSON.stringify({ count: 9 }) }),
+      );
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({ key: "versioned-legacy-envelope-storage", version: 3 }),
+        ],
+      });
+
+      expect(store.getState().count).toBe(9);
+      store.destroy();
+    });
+
     it("runs migrate on an older payload and hydrates its result", () => {
       localStorage.setItem(
         "versioned-migrate-storage",
-        JSON.stringify({ version: 1, state: JSON.stringify({ count: "7" }) }),
+        JSON.stringify({ version: 1, state: { count: "7" } }),
       );
       const migrate = vi.fn((persisted: unknown) => ({
         count: Number((persisted as { count: string }).count),
@@ -398,11 +476,75 @@ describe("persist", () => {
       store.destroy();
     });
 
+    it("runs migrate on an older pre-1.0 string-state envelope", () => {
+      localStorage.setItem(
+        "versioned-migrate-legacy-storage",
+        JSON.stringify({ version: 1, state: JSON.stringify({ count: "7" }) }),
+      );
+      const migrate = vi.fn((persisted: unknown) => ({
+        count: Number((persisted as { count: string }).count),
+      }));
+
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "versioned-migrate-legacy-storage",
+            version: 2,
+            migrate,
+          }),
+        ],
+      });
+
+      expect(migrate).toHaveBeenCalledWith({ count: "7" }, 1);
+      expect(store.getState().count).toBe(7);
+      store.destroy();
+    });
+
+    it("keeps string embedding for a custom serializer and round-trips it", () => {
+      const serialize = (state: Partial<{ count: number }>) => `custom:${state.count}`;
+      const deserialize = (raw: string) => ({ count: Number(raw.slice("custom:".length)) });
+
+      const first = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "versioned-custom-storage",
+            version: 2,
+            serialize,
+            deserialize,
+          }),
+        ],
+      });
+      first.setState({ count: 8 });
+      first.destroy();
+
+      // A custom serializer produces an opaque string, so it stays embedded.
+      expect(JSON.parse(localStorage.getItem("versioned-custom-storage") as string)).toEqual({
+        version: 2,
+        state: "custom:8",
+      });
+
+      const second = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "versioned-custom-storage",
+            version: 2,
+            serialize,
+            deserialize,
+          }),
+        ],
+      });
+      expect(second.getState().count).toBe(8);
+      second.destroy();
+    });
+
     it("discards stored state and warns on version mismatch without migrate", () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       localStorage.setItem(
         "versioned-discard-storage",
-        JSON.stringify({ version: 1, state: JSON.stringify({ count: 9 }) }),
+        JSON.stringify({ version: 1, state: { count: 9 } }),
       );
 
       const store = createStore({

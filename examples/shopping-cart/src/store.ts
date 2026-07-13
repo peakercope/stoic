@@ -45,9 +45,10 @@ export const cart = createStore<CartState, CartDerived>({
     taxRate: 0.0825,
   },
 
-  // Derived values are recomputed in declaration order, so each one below may
-  // safely read the values declared above it. Stoic tracks which fields each
-  // function touches and only recomputes the values downstream of a change.
+  // A derived value can read any other derived value regardless of where it
+  // is declared — reads resolve recursively through the dependency graph.
+  // Stoic tracks which fields each function touches and only recomputes the
+  // values downstream of a change.
   derived: {
     totalItems: ({ items }) => items.reduce((n, item) => n + item.quantity, 0),
 

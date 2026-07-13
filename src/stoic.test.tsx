@@ -1,3 +1,4 @@
+import * as React from "react";
 import { act } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
@@ -685,6 +686,31 @@ describe("action", () => {
     expect(getState().value).toBe(42);
   });
 
+  it("sync action returns its return value to the caller", () => {
+    const { actions } = createStore({ state: { last: "" } });
+    const { createItem } = actions({
+      createItem: ({ set }, title: string) => {
+        set({ last: title });
+        return `id-${title}`;
+      },
+    });
+
+    expect(createItem("a")).toBe("id-a");
+  });
+
+  it("async action resolves with its return value", async () => {
+    const { actions } = createStore({ state: { last: "" } });
+    const { createItem } = actions({
+      createItem: async ({ set }, title: string) => {
+        await Promise.resolve();
+        set({ last: title });
+        return `id-${title}`;
+      },
+    });
+
+    await expect(createItem("a")).resolves.toBe("id-a");
+  });
+
   it("async action returns a promise", () => {
     const { actions } = createStore({ state: { done: false } });
     const { run } = actions({
@@ -1202,6 +1228,97 @@ describe("useStore", () => {
   });
 });
 
+describe("hook bindings", () => {
+  // `const useCart = cart.useStore` is the documented way to get an
+  // identifier-style hook that eslint-plugin-react-hooks can see. That only
+  // works while the store methods never read `this`.
+  it("useStore works detached from the store object", () => {
+    const store = createStore({ state: { count: 7 } });
+    const { useStore } = store;
+
+    const hook = renderHook(() => useStore((s) => s.count));
+    expect(hook.get()).toBe(7);
+
+    act(() => {
+      store.setState({ count: 8 });
+    });
+    expect(hook.get()).toBe(8);
+    hook.unmount();
+  });
+
+  it("useMeta works detached from its action handle", async () => {
+    const store = createStore({ state: { value: "" } });
+    const { load } = store.actions({
+      load: async ({ set }) => {
+        await Promise.resolve();
+        set({ value: "done" });
+      },
+    });
+    const { useMeta } = load;
+
+    const hook = renderHook(() => useMeta());
+    expect(hook.get().status).toBe("idle");
+
+    await act(async () => {
+      await load();
+    });
+    expect(hook.get().status).toBe("success");
+    hook.unmount();
+  });
+});
+
+describe("useStore with a throwing derived value", () => {
+  class Boundary extends React.Component<{ children?: React.ReactNode }, { error: unknown }> {
+    override state = { error: null as unknown };
+    static getDerivedStateFromError(error: unknown) {
+      return { error };
+    }
+    override render() {
+      const { error } = this.state;
+      if (error) return <span>caught:{(error as Error).name}</span>;
+      return this.props.children;
+    }
+  }
+
+  it("surfaces a CircularDependencyError from a selector to the nearest error boundary", () => {
+    const store = createStore<{ flag: boolean }, { a: number; b: number }>({
+      state: { flag: false },
+      derived: {
+        a: (s) => (s.flag ? s.b + 1 : 0),
+        b: (s) => (s.flag ? s.a + 1 : 0),
+      },
+    });
+
+    function View() {
+      return <span>value:{store.useStore((s) => s.a)}</span>;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    act(() =>
+      root.render(
+        <Boundary>
+          <View />
+        </Boundary>,
+      ),
+    );
+    expect(container.textContent).toBe("value:0");
+
+    act(() => {
+      store.setState({ flag: true });
+    });
+
+    expect(container.textContent).toBe("caught:CircularDependencyError");
+
+    errors.mockRestore();
+    act(() => root.unmount());
+    container.remove();
+  });
+});
+
 describe("useStore SSR", () => {
   it("uses the selected state as the server snapshot when rendered on the server", () => {
     const store = createStore({ state: { count: 42, label: "server" } });
@@ -1330,6 +1447,49 @@ describe("shallow", () => {
 
   it("does not recurse into nested objects", () => {
     expect(shallow({ a: { x: 1 } }, { a: { x: 1 } })).toBe(false);
+  });
+
+  it("compares Maps by size and entries", () => {
+    expect(shallow(new Map([["a", 1]]), new Map([["a", 1]]))).toBe(true);
+    expect(shallow(new Map([["a", 1]]), new Map([["a", 2]]))).toBe(false);
+    expect(shallow(new Map([["a", 1]]), new Map([["b", 1]]))).toBe(false);
+    expect(
+      shallow(
+        new Map([["a", 1]]),
+        new Map([
+          ["a", 1],
+          ["b", 2],
+        ]),
+      ),
+    ).toBe(false);
+  });
+
+  it("compares Sets by size and membership", () => {
+    expect(shallow(new Set([1, 2]), new Set([2, 1]))).toBe(true);
+    expect(shallow(new Set([1, 2]), new Set([1, 3]))).toBe(false);
+    expect(shallow(new Set([1]), new Set([1, 2]))).toBe(false);
+  });
+
+  it("does not report distinct Dates, RegExps, or class instances as equal", () => {
+    // These have no own enumerable keys, so a naive key comparison would call
+    // any two of them equal — hiding real changes from selectors.
+    expect(shallow(new Date(1000), new Date(2000))).toBe(false);
+    expect(shallow(/a/, /b/)).toBe(false);
+    class Box {
+      constructor(public value: number) {}
+    }
+    expect(shallow(new Box(1), new Box(1))).toBe(false);
+  });
+
+  it("compares a plain object against a non-plain object as unequal", () => {
+    expect(shallow<unknown>({}, new Date(0))).toBe(false);
+    expect(shallow<unknown>(new Map(), {})).toBe(false);
+  });
+
+  it("still compares arrays element-wise", () => {
+    expect(shallow([1, 2], [1, 2])).toBe(true);
+    expect(shallow([1, 2], [2, 1])).toBe(false);
+    expect(shallow([1], [1, 2])).toBe(false);
   });
 });
 
@@ -1510,6 +1670,22 @@ describe("no-op setState", () => {
     const before = store.getState();
     store.setState({ count: 0 });
     expect(store.getState()).toBe(before);
+  });
+});
+
+describe("subscriber exceptions", () => {
+  it("a throwing subscriber stops later subscribers and propagates to the setState caller", () => {
+    const store = createStore({ state: { n: 0 } });
+    const later = vi.fn();
+    store.subscribe(() => {
+      throw new Error("subscriber boom");
+    });
+    store.subscribe(later);
+
+    expect(() => store.setState({ n: 1 })).toThrow("subscriber boom");
+    // The state change itself is committed before notification.
+    expect(store.getState().n).toBe(1);
+    expect(later).not.toHaveBeenCalled();
   });
 });
 

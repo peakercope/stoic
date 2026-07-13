@@ -1,3 +1,4 @@
+import * as React from "react";
 import { act, StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
@@ -247,6 +248,111 @@ describe("createStoreContext", () => {
       expect(JSON.parse(localStorage.getItem("ctx-storage") as string)).toEqual({ count: 1 });
     });
     localStorage.removeItem("ctx-storage");
+  });
+
+  // React 18 has no <Activity>; the React-18 CI job skips these.
+  const Activity = (
+    React as {
+      Activity?: React.ComponentType<{ mode: "visible" | "hidden"; children?: React.ReactNode }>;
+    }
+  ).Activity;
+
+  describe.skipIf(!Activity)("<Activity>", () => {
+    const Boundary = Activity as NonNullable<typeof Activity>;
+
+    it("recreates the store when revealed after being destroyed while hidden", async () => {
+      const onDestroy = vi.fn();
+      const factory = vi.fn(() => {
+        const store = createStore({
+          state: { count: 0 },
+          plugins: [{ onDestroy } satisfies StoicPlugin<{ count: number }>],
+        });
+        const actions = store.actions({
+          inc: ({ set }) => set((s) => ({ count: s.count + 1 })),
+        });
+        return { store, actions };
+      });
+      const { Provider, useStore, useActions } = createStoreContext(factory);
+
+      function View() {
+        const count = useStore((s) => s.count);
+        const { inc } = useActions();
+        return (
+          <button type="button" onClick={() => inc()}>
+            {count}
+          </button>
+        );
+      }
+
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      const tree = (mode: "visible" | "hidden") => (
+        <Boundary mode={mode}>
+          <Provider>
+            <View />
+          </Provider>
+        </Boundary>
+      );
+
+      act(() => root.render(tree("visible")));
+
+      // Hide the subtree: effects clean up, the deferred destroy fires while
+      // hidden — flushing plugins like a pending persist write.
+      await act(async () => root.render(tree("hidden")));
+      expect(onDestroy).toHaveBeenCalledOnce();
+
+      // Reveal: the Provider must not hand out the destroyed store.
+      await act(async () => root.render(tree("visible")));
+      expect(factory).toHaveBeenCalledTimes(2);
+
+      const button = container.querySelector("button");
+      act(() => button?.click());
+      expect(container.textContent).toBe("1");
+
+      act(() => root.unmount());
+      container.remove();
+    });
+
+    it("does not destroy the store on a hide immediately followed by a reveal", async () => {
+      const onDestroy = vi.fn();
+      const { Provider, useStore } = createStoreContext(() => {
+        const store = createStore({
+          state: { count: 0 },
+          plugins: [{ onDestroy } satisfies StoicPlugin<{ count: number }>],
+        });
+        return { store, actions: {} };
+      });
+
+      function View() {
+        return <span>{useStore((s) => s.count)}</span>;
+      }
+
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      const tree = (mode: "visible" | "hidden") => (
+        <Boundary mode={mode}>
+          <Provider>
+            <View />
+          </Provider>
+        </Boundary>
+      );
+
+      act(() => root.render(tree("visible")));
+
+      // Hide and reveal before the deferred destroy's microtask can run.
+      act(() => {
+        root.render(tree("hidden"));
+        root.render(tree("visible"));
+      });
+      await act(async () => {});
+
+      expect(onDestroy).not.toHaveBeenCalled();
+
+      act(() => root.unmount());
+      container.remove();
+    });
   });
 
   it("throws a helpful error when its hooks are used outside the Provider", () => {

@@ -44,6 +44,30 @@ describe("devtools", () => {
       undefined;
   });
 
+  it("registered before persist, logs the hydration write as anonymous against a pre-hydration init", () => {
+    const extension = installFakeExtension();
+    localStorage.setItem("devtools-order-storage", JSON.stringify({ count: 9 }));
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [
+        // devtools first: it connects before persist hydrates, so its baseline
+        // is the initial state and the hydration shows up as one anonymous
+        // entry in the timeline.
+        devtools<{ count: number }>({ name: "ordered" }),
+        persist<{ count: number }>({ key: "devtools-order-storage" }),
+      ],
+    });
+
+    expect(extension.init).toHaveBeenCalledWith({ count: 0 });
+    expect(extension.send).toHaveBeenCalledTimes(1);
+    expect(extension.send).toHaveBeenCalledWith({ type: "anonymous" }, { count: 9 });
+    expect(store.getState().count).toBe(9);
+
+    store.destroy();
+    localStorage.removeItem("devtools-order-storage");
+  });
+
   it("connects and initializes with the starting state", () => {
     const extension = installFakeExtension();
 

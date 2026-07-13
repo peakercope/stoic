@@ -6,6 +6,12 @@ type DerivedConfig<T, D> = {
   [K in keyof D]: (state: T & D) => D[K];
 };
 
+/**
+ * Thrown when derived values depend on each other in a cycle — at store
+ * creation when the cycle is always present, or on the read of the cyclic
+ * value when it only appears for certain states. The message spells out the
+ * dependency chain.
+ */
 export class CircularDependencyError extends Error {
   constructor(cycle: string[]) {
     super(`Circular dependency detected:\n${cycle.join(" → ")}`);
@@ -18,57 +24,115 @@ const warn = (message: string) => {
   if (nodeProcess?.env?.NODE_ENV !== "production") console.warn(message);
 };
 
+/**
+ * Merges a partial state — or the result of an updater that receives the
+ * current state, derived values included — into the store. Only raw state
+ * keys can be written; derived keys are computed and ignored with a warning.
+ */
 export type SetState<T, Full = T> = (partial: Partial<T> | ((s: Full) => Partial<T>)) => void;
+
+/** The first argument every action receives. */
 export type ActionCtx<T, Full = T> = {
+  /** Updates state, attributing the write to this action (also across `await`s). */
   set: SetState<T, Full>;
+  /** Returns the current state, including derived values. */
   get: () => Full;
 };
-type SyncActionFn<T, Full, A extends unknown[]> = (ctx: ActionCtx<T, Full>, ...args: A) => void;
-type AsyncActionFn<T, Full, A extends unknown[]> = (
-  ctx: ActionCtx<T, Full>,
-  ...args: A
-) => Promise<void>;
+type ActionFn<T, Full, A extends unknown[], R> = (ctx: ActionCtx<T, Full>, ...args: A) => R;
 
 export type ActionStatus = "idle" | "pending" | "success" | "error";
+
+/**
+ * Lifecycle of an action's most recent invocation. `error` is set only while
+ * `status` is `"error"`. When calls overlap, the meta always reflects the
+ * newest call — a stale call settling later never overwrites it.
+ */
 export type ActionMeta = { status: ActionStatus; error: unknown };
 
+/**
+ * A callable action, as returned by `store.actions`. Call it like the
+ * function it wraps (minus the context argument); the extra members expose
+ * its {@link ActionMeta} status.
+ */
 export type ActionHandle<A extends unknown[], R> = ((...args: A) => R) & {
+  /** The meta of the most recent invocation. */
   getMeta: () => ActionMeta;
+  /** Subscribes to meta changes; returns an unsubscribe function. */
   subscribeMeta: (listener: (meta: ActionMeta) => void) => () => void;
+  /** React hook: subscribes the component to this action's meta. */
   useMeta: () => ActionMeta;
 };
 
 // biome-ignore lint/suspicious/noExplicitAny: args are inferred per entry; any is the only sound constraint for heterogeneous tuples
-type ActionMap<T, Full> = Record<string, SyncActionFn<T, Full, any> | AsyncActionFn<T, Full, any>>;
+type ActionMap<T, Full> = Record<string, ActionFn<T, Full, any, unknown>>;
 
 // biome-ignore lint/suspicious/noExplicitAny: `get` makes ActionMap invariant in Full; any keeps the constraint satisfiable for every store type
 type ActionHandlesFor<M extends ActionMap<any, any>, T, Full> = {
-  [K in keyof M]: M[K] extends AsyncActionFn<T, Full, infer A>
-    ? ActionHandle<A, Promise<void>>
-    : M[K] extends SyncActionFn<T, Full, infer A>
-      ? ActionHandle<A, void>
-      : never;
+  [K in keyof M]: M[K] extends ActionFn<T, Full, infer A, infer R> ? ActionHandle<A, R> : never;
 };
 
 export type StoicStore<T, Full = T> = {
+  /** Returns the current state, including derived values. */
   getState: () => Full;
+  /** Merges a partial state (or an updater's result) and notifies listeners. */
   setState: SetState<T, Full>;
+  /**
+   * Calls `listener` with the new state after every change; returns an
+   * unsubscribe function. A listener that throws stops later listeners from
+   * being notified and the error propagates to the `setState` caller.
+   */
   subscribe: (listener: Listener<Full>) => () => void;
+  /**
+   * Turns a map of `(ctx, ...args)` functions into callable
+   * {@link ActionHandle}s. Create handles once at module (or factory) level —
+   * each call builds new handles with fresh, independent meta.
+   */
   actions<M extends ActionMap<T, Full>>(map: M): ActionHandlesFor<M, T, Full>;
+  /**
+   * Runs `fn`, deferring listener notifications until it returns, so several
+   * writes coalesce into one notification. Synchronous only: an `await`
+   * inside the callback escapes the batch.
+   */
   batch: <R>(fn: () => R) => R;
+  /**
+   * Runs plugin `onDestroy` hooks and drops all listeners. Afterwards
+   * `setState` and `subscribe` are ignored (with a dev warning).
+   */
   destroy: () => void;
+  /**
+   * React hook: subscribes the component to the store. Without arguments it
+   * returns the full state (re-rendering on every change); with a `selector`
+   * only changes to the selected value re-render, compared by `equality`
+   * (default `Object.is` — pass `shallow` from `stoic-store/tools` for
+   * object-literal selectors). Detachable: `const useCart = cart.useStore`
+   * gives lint-friendly identifier-style hooks.
+   */
   useStore: <U = Full>(selector?: (state: Full) => U, equality?: (a: U, b: U) => boolean) => U;
 };
 
+/** What `beforeAction`/`afterAction` hooks receive about the running action. */
 export type ActionContext<Full = unknown> = {
   name: string;
   args: unknown[];
   state: Full;
 };
 
+/**
+ * Lifecycle hooks observing a store; pass instances via `createStore`'s
+ * `plugins`. Hooks observe state — they cannot transform it. Define hooks
+ * with method shorthand (`afterSetState(state) {}`), not arrow-function
+ * properties, so they type-check against stores with derived state.
+ */
 export interface StoicPlugin<T extends object = object, Full extends object = T> {
+  /**
+   * Called once when the store is created. Note that React StrictMode
+   * double-invokes store factories in development, so `onInit` can run for a
+   * store that is immediately discarded and never destroyed.
+   */
   onInit?(store: StoicStore<T, Full>): void;
+  /** Called before every action invocation. */
   beforeAction?(ctx: ActionContext<Full>): void;
+  /** Called after every action settles — also when it throws or rejects. */
   afterAction?(ctx: ActionContext<Full>): void;
   /**
    * `actionName` is the action whose `ctx.set` produced the change (also
@@ -78,6 +142,7 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
    * the same way; `undefined` for a direct `store.setState`.
    */
   afterSetState?(state: Full, actionName?: string, actionArgs?: readonly unknown[]): void;
+  /** Called when `store.destroy()` runs. */
   onDestroy?(): void;
 }
 
@@ -97,11 +162,22 @@ type Cell = {
   computing: boolean;
 };
 
+/**
+ * Creates a store from initial `state`, optional `derived` values, and
+ * optional `plugins`. State-only stores infer everything from the config.
+ */
 export function createStore<T extends object>(config: {
   state: T;
   derived?: undefined;
   plugins?: StoicPlugin<T, T>[];
 }): StoicStore<T, T>;
+/**
+ * Creates a store with derived state. Spell out both type parameters —
+ * `createStore<State, Derived>` — because a derived function's argument
+ * includes the derived values themselves, which TypeScript cannot infer
+ * while it is still inferring them. Derived functions must be pure; each is
+ * recomputed only when a top-level state key it read actually changes.
+ */
 export function createStore<T extends object, D extends object>(config: {
   state: T;
   derived: DerivedConfig<T, D>;
@@ -167,13 +243,20 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
 
       const deps: [string, unknown][] = [];
+      // Deduped: a derived fn that reads the same key in a loop must not bloat
+      // the dep record (every entry is re-read on each freshness check). The
+      // snapshot is immutable, so repeat reads see the same value anyway.
+      const seen = new Set<string>();
       const tracked = new Proxy(snap as object, {
         get(target, prop) {
           // Receiver must be the snapshot (not the proxy) so a derived dep's
           // getter memoizes against the snapshot and its own transitive reads
           // are not recorded as this cell's deps.
           const value = Reflect.get(target, prop, target);
-          if (typeof prop === "string") deps.push([prop, value]);
+          if (typeof prop === "string" && !seen.has(prop)) {
+            seen.add(prop);
+            deps.push([prop, value]);
+          }
           return value;
         },
       });
@@ -206,8 +289,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     return snap;
   };
 
-  const initialRaw = { ...config.state };
-  let raw = { ...initialRaw };
+  let raw = { ...config.state };
   let snapshot = makeSnapshot(raw);
   let destroyed = false;
 

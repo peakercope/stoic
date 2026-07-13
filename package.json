@@ -42,6 +42,7 @@
     "test": "vitest",
     "typecheck": "tsc --noEmit",
     "format": "biome check --write",
+    "lint": "biome ci",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "yarn build && changeset publish"

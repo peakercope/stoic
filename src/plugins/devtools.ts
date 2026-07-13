@@ -2,8 +2,11 @@ import type {} from "@redux-devtools/extension";
 import type { StoicPlugin, StoicStore } from "../stoic";
 
 export interface DevtoolsOptions {
+  /** Instance name in the DevTools dropdown; defaults to an auto-generated per-store name. */
   name?: string;
+  /** Whether to connect at all; defaults to `true` outside `NODE_ENV=production`. */
   enabled?: boolean;
+  /** Label for `setState` calls made outside an action; defaults to `"anonymous"`. */
   anonymousActionType?: string;
 }
 
@@ -30,6 +33,11 @@ type Connection = {
 // falls back to `document.title` for every unnamed connection.
 let anonymousStoreCount = 0;
 
+/**
+ * Connects a store to the Redux DevTools browser extension: every action
+ * shows up with its name and arguments, and time-travel is applied back to
+ * the store. A no-op when the extension isn't installed.
+ */
 export function devtools<T extends object, Full extends object = T>(
   options: DevtoolsOptions = {},
 ): StoicPlugin<T, Full> {

@@ -29,13 +29,26 @@ function filterKeys<T extends object>(
   return result;
 }
 
+/**
+ * Saves raw state to storage on every change and restores it when the store
+ * is created. Derived values are never persisted — they are recomputed from
+ * raw state on load. When storage is unavailable (e.g. `localStorage` on a
+ * server), the plugin disables itself with a single warning.
+ */
 export function persist<T extends object>(options: {
+  /** Storage key the state is saved under. */
   key: string;
+  /** Storage backend, e.g. `() => sessionStorage`. Defaults to `localStorage`. */
   storage?: () => Storage;
+  /** Persist only these fields. Mutually exclusive with `exclude`. */
   include?: (keyof T)[];
+  /** Persist everything except these fields. Mutually exclusive with `include`. */
   exclude?: (keyof T)[];
+  /** Custom serialization; defaults to `JSON.stringify`. */
   serialize?: (state: Partial<T>) => string;
+  /** Custom deserialization; defaults to `JSON.parse`. */
   deserialize?: (raw: string) => Partial<T>;
+  /** Delay writes by this many ms, resetting the timer on each change. A pending write is flushed on destroy. */
   debounceMs?: number;
   /**
    * Schema version of the persisted state. When set, payloads are written as
@@ -44,6 +57,7 @@ export function persist<T extends object>(options: {
    * pre-versioning bare payload is treated as version 0.
    */
   version?: number;
+  /** Upgrades a payload written by an older `version` to the current shape. */
   migrate?: (persisted: unknown, version: number) => Partial<T>;
 }): StoicPlugin<T, T> {
   if (options.include && options.exclude) {
@@ -57,14 +71,28 @@ export function persist<T extends object>(options: {
   // Populated in onInit, before any read or write can happen.
   let derivedKeys: ReadonlySet<string> = new Set();
 
+  // Resolved once in onInit. Stays undefined when the backend can't be
+  // reached (e.g. the default `localStorage` on a server), which disables the
+  // plugin after a single warning instead of warning on every write.
+  let storage: Storage | undefined;
+
   const writeToStorage = (state: T) => {
+    if (storage === undefined) return;
     try {
-      const serialized = doSerialize(filterKeys(state, options, derivedKeys));
-      const payload =
-        options.version === undefined
-          ? serialized
-          : JSON.stringify({ version: options.version, state: serialized });
-      getStorage().setItem(options.key, payload);
+      const filtered = filterKeys(state, options, derivedKeys);
+      let payload: string;
+      if (options.version === undefined) {
+        payload = doSerialize(filtered);
+      } else if (options.serialize) {
+        // A custom serializer produces an opaque string, so it stays embedded.
+        payload = JSON.stringify({
+          version: options.version,
+          state: options.serialize(filtered),
+        });
+      } else {
+        payload = JSON.stringify({ version: options.version, state: filtered });
+      }
+      storage.setItem(options.key, payload);
     } catch {
       console.warn("Stoic persist plugin: failed to write state to storage");
     }
@@ -78,24 +106,32 @@ export function persist<T extends object>(options: {
     // A payload written before versioning was enabled is a bare state string
     // and counts as version 0; so does one written by a custom serializer.
     let storedVersion = 0;
-    let stateRaw = raw;
+    let storedState: unknown = raw;
     try {
-      const envelope = JSON.parse(raw) as { version?: unknown; state?: unknown } | null;
+      const envelope = JSON.parse(raw) as {
+        version?: unknown;
+        state?: unknown;
+      } | null;
       if (
         envelope !== null &&
         typeof envelope === "object" &&
         typeof envelope.version === "number" &&
-        typeof envelope.state === "string"
+        "state" in envelope
       ) {
         storedVersion = envelope.version;
-        stateRaw = envelope.state;
+        storedState = envelope.state;
       }
     } catch {
       // Not JSON at the envelope level: legacy payload from a custom serializer.
     }
 
-    if (storedVersion === options.version) return doDeserialize(stateRaw);
-    if (options.migrate) return options.migrate(doDeserialize(stateRaw), storedVersion);
+    // A string is a serialized state — from a custom serializer, that embedded the default-serialized state as a string.
+    // Anything else is the state value itself.
+    const resolve = (value: unknown): Partial<T> =>
+      typeof value === "string" ? doDeserialize(value) : (value as Partial<T>);
+
+    if (storedVersion === options.version) return resolve(storedState);
+    if (options.migrate) return options.migrate(resolve(storedState), storedVersion);
 
     console.warn(
       `Stoic persist plugin: discarding stored state for "${options.key}" — stored version ` +
@@ -130,7 +166,20 @@ export function persist<T extends object>(options: {
       }
 
       try {
-        const raw = getStorage().getItem(options.key);
+        storage = getStorage();
+      } catch {
+        storage = undefined;
+      }
+      if (storage === undefined) {
+        console.warn(
+          `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
+            "persistence is disabled for this store",
+        );
+        return;
+      }
+
+      try {
+        const raw = storage.getItem(options.key);
         const payload = raw != null ? readPayload(raw) : undefined;
         if (payload !== undefined) {
           const parsed = filterKeys(payload as T, options, derivedKeys);
@@ -154,7 +203,7 @@ export function persist<T extends object>(options: {
       }
     },
     afterSetState(state) {
-      if (hydrating) return;
+      if (hydrating || storage === undefined) return;
 
       if (options.debounceMs !== undefined) {
         pendingState = state;

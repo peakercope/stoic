@@ -24,6 +24,7 @@ No reducers • No dependency arrays • No boilerplate • Fully typed • Plug
 <a href="#batching">Batching</a> •
 <a href="#plugins">Plugins</a> •
 <a href="#per-instance-stores">Per-instance Stores</a> •
+<a href="#testing">Testing</a> •
 <a href="#faq">FAQ</a>
 </p>
 
@@ -49,7 +50,7 @@ npm install stoic-store
 yarn add stoic-store
 ```
 
-Stoic requires React 18 or later (it uses `useSyncExternalStore`).
+Stoic requires React 18 or later (it uses `useSyncExternalStore`). The package is published as **ESM only** — every modern bundler and Node 18+ consume it as-is, but legacy CommonJS-only toolchains are not supported.
 
 ---
 
@@ -176,7 +177,20 @@ const { subtotal, total } = cart.useStore(
 );
 ```
 
-You can also pass any custom `(a, b) => boolean` function instead of `shallow`.
+You can also pass any custom `(a, b) => boolean` function instead of `shallow`. `shallow` compares plain objects and arrays one level deep and Maps/Sets by size and membership; other objects (Dates, class instances) are only equal by reference.
+
+### Lint-friendly hook bindings
+
+ESLint's `react-hooks` rules only recognize hooks called as plain `useXxx(...)` identifiers, so method-style calls like `cart.useStore(...)` are invisible to them. The store's hooks don't rely on `this`, so bind them once and export identifier-style hooks:
+
+```tsx
+export const useCart = cart.useStore;
+
+// In components — now checked by rules-of-hooks:
+const total = useCart((state) => state.total);
+```
+
+The same works for action meta: `export const useLoadUserMeta = loadUser.useMeta`.
 
 ---
 
@@ -208,6 +222,22 @@ const { addItem, removeItem, clearCart } = cart.actions({
 ```
 
 Action arguments and store state are both fully typed, so your editor infers them without extra annotations.
+
+An action's return value is passed through to the caller — handy for returning a created id or a computed result:
+
+```tsx
+const { addItem } = cart.actions({
+  addItem: ({ set }, title: string) => {
+    const id = crypto.randomUUID();
+    set((s) => ({ items: [...s.items, { id, title }] }));
+    return id;
+  },
+});
+
+const newId = addItem("Monitor"); // string
+```
+
+Async actions resolve with their return value the same way.
 
 ---
 
@@ -459,7 +489,7 @@ Refresh the page and `settings` is restored automatically. `persist` accepts:
 | `version` | `number` | — | Schema version of the persisted state (see below). |
 | `migrate` | `(persisted, version) => Partial<T>` | — | Upgrade an older payload to the current shape. |
 
-`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed.
+`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed. If storage is unavailable (the default `localStorage` doesn't exist on a server, for example), the plugin disables itself with a single console warning instead of failing on every write.
 
 ```tsx
 persist({
@@ -489,7 +519,7 @@ persist<Settings>({
 });
 ```
 
-With `version` set, payloads are stored as a `{ version, state }` envelope. A payload written before versioning was enabled is treated as version `0`. If the versions differ and no `migrate` is provided, the stored state is discarded (with a console warning) rather than hydrated into the wrong shape.
+With `version` set, payloads are stored as a `{ version, state }` envelope — with the default serializer, `state` is stored as a plain JSON value, so what's in storage stays human-readable; a custom `serialize`'s output is embedded as a string. A payload written before versioning was enabled is treated as version `0`. If the versions differ and no `migrate` is provided, the stored state is discarded (with a console warning) rather than hydrated into the wrong shape.
 
 #### Derived state is never persisted
 
@@ -503,12 +533,14 @@ If you want a value persisted and *not* recomputed, it isn't derived state — p
 
 A plugin is an object implementing any of the `StoicPlugin` lifecycle hooks. Hooks only observe state — they can't transform it:
 
-* `onInit(store)` — called once when the store is created.
+* `onInit(store)` — called once when the store is created. (In development, React StrictMode double-invokes store factories, so `onInit` can also run for a store that is immediately discarded and never destroyed — side effects here should tolerate that.)
 * `beforeAction(ctx)` / `afterAction(ctx)` — called around every action call, with `{ name, args, state }`. `afterAction` still runs if the action throws or rejects.
 * `afterSetState(state, actionName?, actionArgs?)` — called after every update that changed something, with the full merged state. `actionName` is the name of the action whose `set` produced the change (correct even across `await`s and overlapping async actions) and `actionArgs` are the arguments it was called with; both are `undefined` for a direct `store.setState`. During a [`batch`](#batching), the hook fires once when the batch closes, reporting the action behind the last state-changing write — so `persist` writes once and `devtools` logs one combined entry per batch.
 * `onDestroy()` — called when `store.destroy()` is called.
 
 > Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as derived state instead.
+
+> A subscriber or hook that throws stops later subscribers from being notified for that update, and the error propagates to whoever called `setState` (or the action's `set`). Keep subscribers exception-safe.
 
 A plugin that needs to tell raw state apart from derived values (as `persist` does) can inspect the snapshot: derived keys are exposed as enumerable getter properties, raw keys as plain data properties — `Object.getOwnPropertyDescriptor(store.getState(), key)?.get` is set exactly for derived keys, and checking it doesn't trigger any computation.
 
@@ -589,12 +621,49 @@ function CartSummary() {
 
 | Returned | What it is |
 | --- | --- |
-| `Provider` | Creates one store per mount. `init` is read on the first render only — like a `defaultValue`, changing it later won't rebuild the store. |
+| `Provider` | Creates one store per mount. `init` is read on the first render only — like a `defaultValue`, changing it later won't rebuild the store. The prop is required exactly when the factory can't be called without it. |
 | `useStore(selector?, equality?)` | Identical to `store.useStore`, resolved from context. |
 | `useActions()` | This instance's action handles. Stable across renders. |
 | `useStoreApi()` | The `StoicStore` itself, for `getState` / `subscribe` / `batch` outside of render. |
 
 The store is destroyed when its `Provider` unmounts, so plugins get their `onDestroy` (a pending debounced `persist` write is flushed). This is StrictMode-safe: React's mount → unmount → mount cycle in development does not tear down the store.
+
+Inside React's [`<Activity>`](https://react.dev/reference/react/Activity) (React 19.2+), hiding a subtree behaves like an unmount for the store: it is destroyed — flushing plugins — and a fresh one is created when the subtree is revealed. In-memory state does not survive a hide; pair the store with `persist` if it should.
+
+---
+
+## Testing
+
+Two patterns cover most test setups.
+
+**Reset a module-level store between tests.** A store created at module level is shared across tests in the same file. Define a reset action next to the store, and call it in your test setup:
+
+```tsx
+const initialState = { items: [], tax: 0.2 };
+export const cart = createStore<State, Derived>({ state: initialState, /* derived, ... */ });
+
+export const { reset } = cart.actions({
+  reset: ({ set }) => set(initialState),
+});
+```
+
+```tsx
+beforeEach(() => reset());
+```
+
+Note that `setState` merges, so `set(initialState)` restores every key it names — list all of them (spreading a captured `initialState` object does exactly that).
+
+**One store per test.** If your stores are behind [`createStoreContext`](#per-instance-stores), each `render` with a fresh `Provider` gets an isolated store — nothing to reset:
+
+```tsx
+render(
+  <Provider init={fixtureItems}>
+    <Cart />
+  </Provider>,
+);
+```
+
+Assertions against the store outside of components work through the plain API: `store.getState()`, `store.subscribe`, or calling actions directly — none of them need React.
 
 ---
 
@@ -639,6 +708,10 @@ Yes, but `useStore` relies on `useSyncExternalStore`, a hook — so any componen
 Only for request-independent data. A store created at module level is a **singleton per JavaScript process**. In the browser that's exactly what you want; on an SSR server it means every request shares the same store, so one user's state can leak into another's render.
 
 If you render on the server and put per-user data in a store, create it per request with [`createStoreContext`](#per-instance-stores) instead.
+
+### Does Stoic work with concurrent rendering?
+
+Yes. `useStore` is built on `useSyncExternalStore`, React's sanctioned way to read external stores without tearing. As with every uSES-based library an external-store update de-opts that render to synchronous — the standard trade-off React makes for consistency.
 
 ### What happens if my derived values depend on each other in a cycle?
 
