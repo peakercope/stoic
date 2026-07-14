@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createStore } from "../stoic";
-import { persist } from "./persist";
+import { type PersistDriver, persist, webStorage } from "./persist";
 
 describe("persist", () => {
   it("writes state to localStorage after setState", () => {
@@ -27,13 +27,14 @@ describe("persist", () => {
     store.destroy();
   });
 
-  it("respects a custom storage option", () => {
+  // A bare web `Storage` already satisfies PersistDriver — no adapter needed.
+  it("respects a custom driver", () => {
     const store = createStore({
       state: { count: 0 },
       plugins: [
         persist<{ count: number }>({
           key: "session-storage",
-          storage: () => sessionStorage,
+          driver: sessionStorage,
         }),
       ],
     });
@@ -393,17 +394,17 @@ describe("persist", () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       let failWrites = true;
       const written: string[] = [];
-      const storage = {
+      const driver: PersistDriver = {
         getItem: () => null,
-        setItem: (_key: string, value: string) => {
+        setItem: (_key, value) => {
           if (failWrites) throw new Error("quota exceeded");
           written.push(value);
         },
-      } as unknown as Storage;
+      };
 
       const store = createStore({
         state: { n: 0 },
-        plugins: [persist<{ n: number }>({ key: "failing-storage", storage: () => storage })],
+        plugins: [persist<{ n: number }>({ key: "failing-storage", driver })],
       });
 
       store.setState({ n: 1 });
@@ -429,10 +430,10 @@ describe("persist", () => {
         plugins: [
           persist<{ count: number }>({
             key: "unavailable-storage",
-            // Mirrors `() => localStorage` on a server, where the global is undefined.
-            storage: () => {
+            // Mirrors `localStorage` on a server, where the global is undefined.
+            driver: webStorage(() => {
               throw new ReferenceError("localStorage is not defined");
-            },
+            }),
           }),
         ],
       });
@@ -720,9 +721,9 @@ describe("persist", () => {
         plugins: [
           persist<{ count: number }>({
             key: "prod-unavailable-storage",
-            storage: () => {
+            driver: webStorage(() => {
               throw new Error("no storage here");
-            },
+            }),
           }),
         ],
       });
@@ -731,6 +732,252 @@ describe("persist", () => {
       expect(warn).not.toHaveBeenCalled();
       warn.mockRestore();
       vi.unstubAllEnvs();
+      store.destroy();
+    });
+  });
+
+  describe("async drivers", () => {
+    // Shaped like React Native's AsyncStorage: same method names as web
+    // `Storage`, but promise-returning.
+    const asyncDriver = (initial?: string) => {
+      const values = new Map<string, string>();
+      if (initial !== undefined) values.set("async", initial);
+      const writes: string[] = [];
+      return {
+        writes,
+        driver: {
+          getItem: (key) => Promise.resolve(values.get(key) ?? null),
+          setItem: async (key, value) => {
+            writes.push(value);
+            values.set(key, value);
+          },
+        } satisfies PersistDriver,
+      };
+    };
+
+    it("hydrates once the read resolves", async () => {
+      const { driver } = asyncDriver(JSON.stringify({ count: 42 }));
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "async", driver })],
+      });
+
+      // Async storage cannot land before the first render, by definition.
+      expect(store.getState()).toEqual({ count: 0 });
+
+      await vi.waitFor(() => {
+        expect(store.getState()).toEqual({ count: 42 });
+      });
+      store.destroy();
+    });
+
+    it("does not clobber a write that lands while the read is in flight", async () => {
+      const { driver } = asyncDriver(JSON.stringify({ count: 42 }));
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "async", driver })],
+      });
+
+      // The user acted before the stored payload arrived; their state is newer.
+      store.setState({ count: 1 });
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(store.getState()).toEqual({ count: 1 });
+      store.destroy();
+    });
+
+    it("coalesces writes so storage converges on the last state", async () => {
+      const { driver, writes } = asyncDriver();
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "async", driver })],
+      });
+      await vi.waitFor(() => {
+        expect(writes).toEqual([]);
+      });
+
+      store.setState({ count: 1 });
+      store.setState({ count: 2 });
+      store.setState({ count: 3 });
+
+      await vi.waitFor(() => {
+        // The first write goes out immediately; 2 and 3 arrive while it is in
+        // flight, and only the newest survives — 2 is never written.
+        expect(writes).toEqual([JSON.stringify({ count: 1 }), JSON.stringify({ count: 3 })]);
+      });
+      store.destroy();
+    });
+
+    it("ignores a read that resolves after the store is destroyed", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { driver } = asyncDriver(JSON.stringify({ count: 42 }));
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "async", driver })],
+      });
+
+      store.destroy();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // A setState here would warn about writing to a destroyed store.
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+  });
+
+  describe("onHydrate", () => {
+    it("fires with the hydrated state once an async read resolves", async () => {
+      const values = new Map([["on-hydrate", JSON.stringify({ count: 9 })]]);
+      const hydrated: { count: number }[] = [];
+      createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "on-hydrate",
+            driver: { getItem: async (key) => values.get(key) ?? null, setItem: async () => {} },
+            onHydrate: (state) => hydrated.push({ ...state }),
+          }),
+        ],
+      });
+
+      await vi.waitFor(() => {
+        expect(hydrated).toEqual([{ count: 9 }]);
+      });
+    });
+
+    it("fires even when nothing is stored, so callers can always un-gate", () => {
+      const hydrated: { count: number }[] = [];
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "on-hydrate-empty",
+            onHydrate: (state) => hydrated.push({ ...state }),
+          }),
+        ],
+      });
+
+      expect(hydrated).toEqual([{ count: 0 }]);
+      store.destroy();
+    });
+
+    it("fires even when storage is unavailable", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let fired = false;
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "on-hydrate-unavailable",
+            driver: webStorage(() => {
+              throw new ReferenceError("localStorage is not defined");
+            }),
+            onHydrate: () => {
+              fired = true;
+            },
+          }),
+        ],
+      });
+
+      expect(fired).toBe(true);
+      warn.mockRestore();
+      store.destroy();
+    });
+  });
+
+  describe("sync", () => {
+    const storageEvent = (key: string, newValue: string | null) =>
+      window.dispatchEvent(
+        new StorageEvent("storage", { key, newValue, storageArea: localStorage }),
+      );
+
+    it("applies state another tab wrote", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "sync-tabs", sync: true })],
+      });
+
+      storageEvent("sync-tabs", JSON.stringify({ count: 5 }));
+
+      expect(store.getState()).toEqual({ count: 5 });
+      store.destroy();
+    });
+
+    it("does not re-persist what it just applied", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "sync-echo", sync: true })],
+      });
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+
+      storageEvent("sync-echo", JSON.stringify({ count: 5 }));
+
+      expect(setItem).not.toHaveBeenCalled();
+      setItem.mockRestore();
+      store.destroy();
+    });
+
+    it("ignores other keys, other storage areas, and removals", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "sync-scope", sync: true })],
+      });
+
+      storageEvent("another-key", JSON.stringify({ count: 5 }));
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "sync-scope",
+          newValue: JSON.stringify({ count: 5 }),
+          storageArea: sessionStorage,
+        }),
+      );
+      // Clearing storage elsewhere is not a request to reset the store.
+      storageEvent("sync-scope", null);
+
+      expect(store.getState()).toEqual({ count: 0 });
+      store.destroy();
+    });
+
+    it("stops listening once the store is destroyed", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "sync-destroy", sync: true })],
+      });
+
+      store.destroy();
+      storageEvent("sync-destroy", JSON.stringify({ count: 5 }));
+
+      expect(store.getState()).toEqual({ count: 0 });
+    });
+
+    it("is off by default", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "sync-off" })],
+      });
+
+      storageEvent("sync-off", JSON.stringify({ count: 5 }));
+
+      expect(store.getState()).toEqual({ count: 0 });
+      store.destroy();
+    });
+
+    it("warns when the driver cannot subscribe", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({
+            key: "sync-no-subscribe",
+            // A bare Storage has no `subscribe`.
+            driver: sessionStorage,
+            sync: true,
+          }),
+        ],
+      });
+
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("subscribe"));
+      warn.mockRestore();
       store.destroy();
     });
   });

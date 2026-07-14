@@ -502,12 +502,14 @@ Refresh the page and `settings` is restored automatically. `persist` accepts:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `key` | `string` | *(required)* | Storage key the state is saved under. |
-| `storage` | `() => Storage` | `() => localStorage` | Storage backend, e.g. `() => sessionStorage`. |
+| `driver` | `PersistDriver` | `webStorage()` | Where state is stored (see below). |
+| `sync` | `boolean` | `false` | Apply state written by another tab or process (see below). |
 | `include` | `(keyof T)[]` | — | Persist only these fields. |
 | `exclude` | `(keyof T)[]` | — | Persist everything except these fields. |
 | `serialize` | `(state) => string` | `JSON.stringify` | Custom serialization. |
 | `deserialize` | `(raw) => Partial<T>` | `JSON.parse` | Custom deserialization. |
 | `debounceMs` | `number` | — | Delay writes, resetting the timer on each change. |
+| `onHydrate` | `(state: T) => void` | — | Called once a hydration attempt settles (see below). |
 | `version` | `number` | — | Schema version of the persisted state (see below). |
 | `migrate` | `(persisted, version) => Partial<T>` | — | Upgrade an older payload to the current shape. |
 | `skipHydration` | `boolean` | `false` | Don't hydrate at store creation; call `rehydrate()` on the plugin instance instead (see below). |
@@ -521,6 +523,51 @@ persist({
   debounceMs: 250,               // batch rapid updates into one write
 });
 ```
+
+#### Drivers
+
+`persist` doesn't know where your data lives. That's the driver's job:
+
+```ts
+interface PersistDriver {
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): unknown | Promise<unknown>;
+  subscribe?(key: string, onChange: (value: string | null) => void): () => void;
+}
+```
+
+Because the return types allow promises, both web `Storage` and React Native's `AsyncStorage` satisfy the interface **as-is** — there's nothing to adapt:
+
+```tsx
+import AsyncStorage from "@react-native-async-storage/async-storage";
+
+persist({ key: "settings", driver: sessionStorage });  // web, synchronous
+persist({ key: "settings", driver: AsyncStorage });    // React Native, async
+```
+
+Anything else — IndexedDB, MMKV, Capacitor Preferences, SQLite, an encrypted store — is an object with those two methods. Synchronous drivers stay synchronous: the default `localStorage` still hydrates *before* your first render, with no promise in the path.
+
+An async driver can't do that, so state arrives a tick later. Use `onHydrate` to know when it has — it fires once the read settles, whether it restored a payload, found nothing, or failed, so it's always safe to gate a splash screen on:
+
+```tsx
+persist({
+  key: "settings",
+  driver: AsyncStorage,
+  onHydrate: () => setReady(true),
+});
+```
+
+Concurrent writes to an async driver are coalesced rather than queued: if a write is in flight when the next one arrives, only the newest state is written when it settles, so storage converges on the last commit without a backlog. And if you write to the store while the initial read is still in flight, the stored payload is dropped — your newer state wins instead of being clobbered by it.
+
+#### Cross-tab sync
+
+With `sync: true`, state another tab writes is applied to this store as it happens. It needs a driver with `subscribe`; the default `localStorage` driver has one (built on the `storage` event):
+
+```tsx
+persist({ key: "settings", sync: true });
+```
+
+Applying a synced payload doesn't re-persist it, so two tabs can't write back and forth at each other. Clearing storage elsewhere (a `null` value) leaves the store alone — that's not a request to reset it. The listener is removed when the store is destroyed.
 
 #### Server rendering and manual hydration
 

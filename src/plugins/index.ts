@@ -1,2 +1,2 @@
 export { devtools } from "./devtools";
-export { persist } from "./persist";
+export { type PersistDriver, type PersistPlugin, persist, webStorage } from "./persist";

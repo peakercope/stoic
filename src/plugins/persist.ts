@@ -1,6 +1,68 @@
 import { isDevEnv } from "../env";
 import type { StoicPlugin, StoicStore } from "../stoic";
 
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * Where persisted state lives. Return types are widened to allow promises, so
+ * web `Storage` (`localStorage`, `sessionStorage`) and React Native's
+ * `AsyncStorage` both satisfy this as-is — no adapter needed. Anything else
+ * (IndexedDB, MMKV, SQLite, an encrypted store) is an object with these methods.
+ */
+export interface PersistDriver {
+  getItem(key: string): MaybePromise<string | null>;
+  setItem(key: string, value: string): MaybePromise<unknown>;
+  /**
+   * Notifies when another context (a second tab, another process) writes `key`,
+   * with the value it wrote — or `null` when it was removed. Returns an
+   * unsubscribe. Drivers without one cannot be used with `sync`.
+   */
+  subscribe?(key: string, onChange: (value: string | null) => void): () => void;
+}
+
+/**
+ * The default driver: `localStorage`, with cross-tab notification via the
+ * `storage` event. The backend is resolved lazily on each call, so building the
+ * driver is safe on a server, where touching `localStorage` would throw.
+ */
+export function webStorage(getStorage: () => Storage = () => localStorage): PersistDriver {
+  return {
+    getItem: (key) => getStorage().getItem(key),
+    setItem: (key, value) => {
+      getStorage().setItem(key, value);
+    },
+    subscribe(key, onChange) {
+      const area = getStorage();
+      const listener = (event: StorageEvent) => {
+        // `storage` fires for every key of every area in the document.
+        if (event.key === key && event.storageArea === area) onChange(event.newValue);
+      };
+      window.addEventListener("storage", listener);
+      return () => {
+        window.removeEventListener("storage", listener);
+      };
+    },
+  };
+}
+
+/**
+ * Runs `ok` on the driver's result whether the driver is synchronous or async,
+ * routing both a synchronous throw and a rejection to `fail`. A sync driver
+ * never yields to the microtask queue, so hydration still lands before the
+ * first render.
+ */
+function settle<V>(run: () => MaybePromise<V>, ok: (value: V) => void, fail: () => void): void {
+  let result: MaybePromise<V>;
+  try {
+    result = run();
+  } catch {
+    fail();
+    return;
+  }
+  if (result instanceof Promise) result.then(ok, fail);
+  else ok(result);
+}
+
 // Derived values are always recomputed from raw state, so they are dropped on
 // the way out (never written) and on the way back in (a persisted derived value
 // is stale by definition, and would survive rehydration untouched whenever its
@@ -50,8 +112,17 @@ export type PersistPlugin<T extends object> = StoicPlugin<T, T> & {
 export function persist<T extends object>(options: {
   /** Storage key the state is saved under. */
   key: string;
-  /** Storage backend, e.g. `() => sessionStorage`. Defaults to `localStorage`. */
-  storage?: () => Storage;
+  /**
+   * Where state is stored. Defaults to `localStorage`. Web `Storage` and React
+   * Native's `AsyncStorage` can be passed directly; async drivers hydrate as
+   * soon as the read resolves (see `onHydrate`).
+   */
+  driver?: PersistDriver;
+  /**
+   * Apply state written by another tab or process as it happens. Requires a
+   * driver with `subscribe`; the default `localStorage` driver has one.
+   */
+  sync?: boolean;
   /** Persist only these fields. Mutually exclusive with `exclude`. */
   include?: (keyof T)[];
   /** Persist everything except these fields. Mutually exclusive with `include`. */
@@ -62,6 +133,13 @@ export function persist<T extends object>(options: {
   deserialize?: (raw: string) => Partial<T>;
   /** Delay writes by this many ms, resetting the timer on each change. A pending write is flushed on destroy. */
   debounceMs?: number;
+  /**
+   * Called with the state once a hydration attempt settles — whether it
+   * restored a payload, found nothing stored, or failed. With an async driver
+   * that happens after the first render, so this is how a splash screen learns
+   * it can go away.
+   */
+  onHydrate?: (state: T) => void;
   /**
    * Schema version of the persisted state. When set, payloads are written as
    * a `{ version, state }` envelope; on load, a payload whose version differs
@@ -89,38 +167,84 @@ export function persist<T extends object>(options: {
     );
   }
 
-  const getStorage = options.storage ?? (() => localStorage);
+  const driver = options.driver ?? webStorage();
   const doSerialize = options.serialize ?? JSON.stringify;
   const doDeserialize = options.deserialize ?? (JSON.parse as (raw: string) => Partial<T>);
 
   // Populated in onInit, before any read or write can happen.
   let derivedKeys: ReadonlySet<string> = new Set();
 
-  // Resolved once in onInit. Stays undefined when the backend can't be
-  // reached (e.g. the default `localStorage` on a server), which disables the
-  // plugin after a single warning instead of warning on every write.
-  let storage: Storage | undefined;
+  // Set in onInit; hydration (automatic or via rehydrate()) needs the store.
+  let boundStore: StoicStore<T, T> | undefined;
+
+  let hydrating = false;
+  let destroyed = false;
+  let disabled = false;
+  let unsubscribe: (() => void) | undefined;
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingState: T | undefined;
+
+  // Set when the backend can't be reached at all (e.g. the default
+  // `localStorage` on a server), which disables the plugin after a single
+  // warning instead of warning on every write.
+  const unavailable = () => {
+    if (disabled) return;
+    disabled = true;
+    if (isDevEnv()) {
+      console.warn(
+        `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
+          "persistence is disabled for this store",
+      );
+    }
+  };
+
+  const encode = (state: T): string => {
+    const filtered = filterKeys(state, options, derivedKeys);
+    if (options.version === undefined) return doSerialize(filtered);
+    // A custom serializer produces an opaque string, so it stays embedded.
+    if (options.serialize) {
+      return JSON.stringify({ version: options.version, state: options.serialize(filtered) });
+    }
+    return JSON.stringify({ version: options.version, state: filtered });
+  };
+
+  // An async driver can have a write in flight when the next one arrives.
+  // Writes are coalesced rather than queued: only the newest state matters, so
+  // storage converges on the last commit without an unbounded backlog.
+  let writing = false;
+  let queued: T | undefined;
 
   const writeToStorage = (state: T) => {
-    if (storage === undefined) return;
+    if (disabled) return;
+    if (writing) {
+      queued = state;
+      return;
+    }
+
+    let payload: string;
     try {
-      const filtered = filterKeys(state, options, derivedKeys);
-      let payload: string;
-      if (options.version === undefined) {
-        payload = doSerialize(filtered);
-      } else if (options.serialize) {
-        // A custom serializer produces an opaque string, so it stays embedded.
-        payload = JSON.stringify({
-          version: options.version,
-          state: options.serialize(filtered),
-        });
-      } else {
-        payload = JSON.stringify({ version: options.version, state: filtered });
-      }
-      storage.setItem(options.key, payload);
+      payload = encode(state);
     } catch {
       console.warn("Stoic persist plugin: failed to write state to storage");
+      return;
     }
+
+    const done = () => {
+      writing = false;
+      const next = queued;
+      queued = undefined;
+      if (next !== undefined) writeToStorage(next);
+    };
+
+    writing = true;
+    settle(
+      () => driver.setItem(options.key, payload),
+      done,
+      () => {
+        console.warn("Stoic persist plugin: failed to write state to storage");
+        done();
+      },
+    );
   };
 
   // Resolves a raw storage payload to the state to hydrate, or undefined to
@@ -165,15 +289,40 @@ export function persist<T extends object>(options: {
     return undefined;
   };
 
-  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-  let pendingState: T | undefined;
-  let hydrating = false;
+  // Merges a raw payload into the store. Shared by hydration and by `sync`,
+  // which is the same operation with a different trigger. A `null` value (the
+  // key was removed elsewhere) leaves state alone — clearing storage is not a
+  // request to reset the store.
+  const applyPayload = (raw: string | null) => {
+    const store = boundStore;
+    if (store === undefined || raw === null) return;
+    try {
+      const payload = readPayload(raw);
+      if (payload === undefined) return;
 
-  // Set in onInit; hydration (automatic or via rehydrate()) needs the store.
-  let boundStore: StoicStore<T, T> | undefined;
+      const parsed = filterKeys(payload as T, options, derivedKeys);
+      // Drop keys the store no longer has: a stale payload would otherwise
+      // merge them into state and re-persist them forever.
+      const current = store.getState();
+      for (const key of Object.keys(parsed) as (keyof T)[]) {
+        if (!(key in current)) delete parsed[key];
+      }
+      // Writing back what was just read is pointless; suppress the
+      // afterSetState this rehydration triggers.
+      hydrating = true;
+      try {
+        store.setState(parsed);
+      } finally {
+        hydrating = false;
+      }
+    } catch {
+      console.warn("Stoic persist plugin: failed to read state from storage");
+    }
+  };
 
   const hydrate = () => {
-    if (boundStore === undefined) {
+    const store = boundStore;
+    if (store === undefined) {
       if (isDevEnv()) {
         console.warn(
           "Stoic persist plugin: rehydrate() called before the plugin was attached to a " +
@@ -182,30 +331,29 @@ export function persist<T extends object>(options: {
       }
       return;
     }
-    if (storage === undefined) return;
-    try {
-      const raw = storage.getItem(options.key);
-      const payload = raw != null ? readPayload(raw) : undefined;
-      if (payload !== undefined) {
-        const parsed = filterKeys(payload as T, options, derivedKeys);
-        // Drop keys the store no longer has: a stale payload would otherwise
-        // merge them into state and re-persist them forever.
-        const current = boundStore.getState();
-        for (const key of Object.keys(parsed) as (keyof T)[]) {
-          if (!(key in current)) delete parsed[key];
-        }
-        // Writing back what was just read is pointless; suppress the
-        // afterSetState this rehydration triggers.
-        hydrating = true;
-        try {
-          boundStore.setState(parsed);
-        } finally {
-          hydrating = false;
-        }
-      }
-    } catch {
-      console.warn("Stoic persist plugin: failed to read state from storage");
-    }
+    if (disabled) return;
+
+    // The core mints a new snapshot object on every real write, so snapshot
+    // identity is a free signal for "did the store change while the read was in
+    // flight". It cannot, for a synchronous driver.
+    const before = store.getState();
+    const finish = () => {
+      options.onHydrate?.(store.getState());
+    };
+
+    settle(
+      () => driver.getItem(options.key),
+      (raw) => {
+        // A write landed during an async read: the live state is newer than the
+        // payload, so applying it would clobber what the user just did.
+        if (!destroyed && store.getState() === before) applyPayload(raw);
+        finish();
+      },
+      () => {
+        unavailable();
+        finish();
+      },
+    );
   };
 
   return {
@@ -230,32 +378,39 @@ export function persist<T extends object>(options: {
         }
       }
 
-      try {
-        storage = getStorage();
-      } catch {
-        storage = undefined;
-      }
-      if (storage === undefined) {
-        if (isDevEnv()) {
+      if (options.sync) {
+        if (driver.subscribe) {
+          try {
+            unsubscribe = driver.subscribe(options.key, (raw) => {
+              // Our own writes never come back through here (the DOM `storage`
+              // event does not fire in the tab that wrote), and for any other
+              // transport `hydrating` suppresses the re-persist — so applying a
+              // payload cannot loop.
+              if (!destroyed && !disabled) applyPayload(raw);
+            });
+          } catch {
+            unavailable();
+          }
+        } else if (isDevEnv()) {
           console.warn(
-            `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
-              "persistence is disabled for this store",
+            `Stoic persist plugin: \`sync\` is set for "${options.key}" but the driver has no ` +
+              "`subscribe`; cross-context sync is disabled",
           );
         }
-        return;
       }
 
       if (!options.skipHydration) hydrate();
     },
     rehydrate: hydrate,
     afterSetState(state) {
-      if (hydrating || storage === undefined) return;
+      if (hydrating || disabled) return;
 
       if (options.debounceMs !== undefined) {
         pendingState = state;
         if (debounceTimer !== undefined) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
           debounceTimer = undefined;
+          pendingState = undefined;
           writeToStorage(state);
         }, options.debounceMs);
         return;
@@ -264,10 +419,15 @@ export function persist<T extends object>(options: {
       writeToStorage(state);
     },
     onDestroy() {
+      destroyed = true;
+      unsubscribe?.();
+      unsubscribe = undefined;
+      queued = undefined;
       if (debounceTimer !== undefined) {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
         writeToStorage(pendingState as T);
+        pendingState = undefined;
       }
     },
   };
