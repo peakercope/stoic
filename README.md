@@ -37,7 +37,7 @@ The key difference from most state managers: Stoic tracks the relationships betw
 
 * ⚡️ Plain function actions — no dispatch, no action types
 * 🧠 Reactive derived state with automatic dependency tracking
-* 🚀 First-class async actions, with built-in pending/error status
+* 🚀 First-class async actions, with built-in pending/error status and `AbortSignal` cancellation
 * 🔌 A small plugin system (`persist` and `devtools` are included; write your own for the rest)
 * 💙 Fully typed, with state and action arguments inferred by your editor
 
@@ -216,10 +216,11 @@ Actions update the store. Instead of dispatching action objects, you call a plai
 setTax(0.15);
 ```
 
-Every action receives a context as its first argument, followed by whatever arguments you call it with. The context has two members:
+Every action receives a context as its first argument, followed by whatever arguments you call it with. The context has three members:
 
 * `set` — updates state. Accepts either a partial state object or an updater function that reads the current state.
 * `get` — returns the current state (including derived values), useful for reading mid-action.
+* `signal` — an `AbortSignal` that is aborted when a newer call of the same action starts, or when the store is destroyed. See [Overlapping calls and cancellation](#overlapping-calls-and-cancellation).
 
 ```tsx
 const { addItem, removeItem, clearCart } = cart.actions({
@@ -305,17 +306,34 @@ if (status === "error") {
 
 `status` is one of `"idle" | "pending" | "success" | "error"`. Outside React, `loadUser.getMeta()` returns the current meta and `loadUser.subscribeMeta(listener)` watches it.
 
-### Overlapping calls and stale responses
+### Overlapping calls and cancellation
 
-Stoic does not cancel async work. If the same action is called again while a previous call is still in flight, **both** calls' `set`s land — the slower response can overwrite the faster one. The meta status always reflects the *most recent* call, but state writes are on you. Use `get` to drop a stale result:
+If the same action is called again while a previous call is still in flight, **both** calls' `set`s land — the slower response can overwrite the faster one. The meta status always reflects the *most recent* call, but state writes are on you.
+
+For work that is abortable, the fix is `ctx.signal`: each call's signal is aborted the moment a newer call of the same action starts (and when the store is destroyed, e.g. its [`Provider`](#per-instance-stores) unmounts). Pass it to `fetch` and the stale request is cancelled on the wire — it rejects instead of landing:
+
+```tsx
+const { selectUser } = search.actions({
+  selectUser: async ({ set, signal }, login: string) => {
+    set({ selected: login });
+    const profile = await api.fetchProfile(login, signal);
+
+    set({ profile }); // never reached if a newer call aborted this one
+  },
+});
+```
+
+The signal is created lazily — actions that don't read it pay nothing, and their overlapping calls are unaffected. An aborted call's promise rejects with an `AbortError`, like any other failing async action; the existing latest-call-wins rule means that rejection never touches the newer call's meta, so `useActionMeta` won't flash an error. If you `await` an action that can be aborted, be ready to catch it.
+
+For async work that *can't* be aborted, use `get` to drop the stale result after the fact:
 
 ```tsx
 const { selectUser } = search.actions({
   selectUser: async ({ set, get }, login: string) => {
     set({ selected: login });
-    const profile = await api.fetchProfile(login);
+    const profile = await legacyFetchProfile(login); // not abortable
 
-    // Another user was selected while this fetch was in flight — drop it.
+    // Another user was selected while this was in flight — drop it.
     if (get().selected !== login) return;
 
     set({ profile });
@@ -738,7 +756,7 @@ The store returned by `createStore`:
 | `subscribe(listener)` | Calls `listener(state)` after every change; returns an unsubscribe function. |
 | `actions(map)` | Turns a map of `(ctx, ...args)` functions into callable [action handles](#actions). |
 | `batch(fn)` | Runs `fn`, coalescing all notifications into one (see [Batching](#batching)). |
-| `destroy()` | Runs plugin `onDestroy` hooks and drops all listeners. |
+| `destroy()` | Aborts in-flight action signals, runs plugin `onDestroy` hooks, and drops all listeners. |
 
 An action handle is the function itself plus `getMeta()` (the current [`ActionMeta`](#tracking-status)) and `subscribeMeta(listener)`.
 

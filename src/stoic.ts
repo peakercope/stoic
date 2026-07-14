@@ -36,6 +36,13 @@ export type ActionCtx<T, Full = T> = {
   set: SetState<T, Full>;
   /** Returns the current state, including derived values. */
   get: () => Full;
+  /**
+   * Aborted when a newer call of this action starts, or when the store is
+   * destroyed. Created lazily on first read — actions that never use it pay
+   * nothing. Pass it to `fetch` (or check `signal.aborted`) to cancel stale
+   * async work.
+   */
+  signal: AbortSignal;
 };
 type ActionFn<T, Full, A extends unknown[], R> = (ctx: ActionCtx<T, Full>, ...args: A) => R;
 
@@ -93,8 +100,9 @@ export type StoicStore<T, Full = T> = {
    */
   batch: <R>(fn: () => R) => R;
   /**
-   * Runs plugin `onDestroy` hooks and drops all listeners. Afterwards
-   * `setState` and `subscribe` are ignored (with a dev warning).
+   * Aborts in-flight action signals, runs plugin `onDestroy` hooks, and drops
+   * all listeners. Afterwards `setState` and `subscribe` are ignored (with a
+   * dev warning).
    */
   destroy: () => void;
 };
@@ -189,6 +197,9 @@ export function createStore<T extends object, D extends object = Record<never, n
   }
   const plugins = config.plugins ?? [];
   const listeners = new Set<Listener<Full>>();
+  // Controllers of in-flight action calls that read `ctx.signal`, so destroy()
+  // can abort them all.
+  const activeControllers = new Set<AbortController>();
 
   const runHooks = <K extends keyof StoicPlugin<T, Full>>(
     hook: K,
@@ -320,8 +331,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     if (notifyDepth >= MAX_NOTIFY_DEPTH) {
       throw new Error(
-        "stoic: maximum update depth exceeded. A plugin or subscriber calls setState on every " +
-          "state change, creating an infinite update loop.",
+        "stoic: maximum update depth exceeded. A plugin or subscriber calls setState on every state change, creating an infinite update loop.",
       );
     }
     notifyDepth++;
@@ -399,6 +409,9 @@ export function createStore<T extends object, D extends object = Record<never, n
     // not overwrite the outcome of a newer one.
     let latestCall = 0;
     const metaListeners = new Set<(meta: ActionMeta) => void>();
+    // Controller of the newest in-flight call that read `ctx.signal`; the next
+    // call aborts it. Cleared on settle so a finished call is never aborted.
+    let currentController: AbortController | null = null;
 
     const setMeta = (callId: number, next: ActionMeta) => {
       if (callId !== latestCall) return;
@@ -410,12 +423,26 @@ export function createStore<T extends object, D extends object = Record<never, n
     };
 
     const runner = (...args: unknown[]) => {
+      if (currentController !== null) {
+        activeControllers.delete(currentController);
+        const previous = currentController;
+        currentController = null;
+        previous.abort();
+      }
+
       runHooks("beforeAction", { name, args, state: getState() });
 
       const callId = ++latestCall;
       setMeta(callId, { status: "pending", error: undefined });
 
+      // Lazy: allocated only when the action reads `ctx.signal`.
+      let controller: AbortController | null = null;
+
       const settle = (outcome: ActionMeta) => {
+        if (controller !== null && currentController === controller) {
+          activeControllers.delete(controller);
+          currentController = null;
+        }
         runHooks("afterAction", { name, args, state: getState() });
         setMeta(callId, outcome);
       };
@@ -436,9 +463,22 @@ export function createStore<T extends object, D extends object = Record<never, n
         }
       };
 
+      const ctx: ActionCtx<T, Full> = {
+        set,
+        get: getState,
+        get signal() {
+          if (controller === null) {
+            controller = new AbortController();
+            currentController = controller;
+            activeControllers.add(controller);
+          }
+          return controller.signal;
+        },
+      };
+
       let result: unknown;
       try {
-        result = fn({ set, get: getState }, ...args);
+        result = fn(ctx, ...args);
       } catch (err) {
         settle({ status: "error", error: err });
         throw err;
@@ -489,6 +529,8 @@ export function createStore<T extends object, D extends object = Record<never, n
   const destroy = () => {
     if (destroyed) return;
     destroyed = true;
+    for (const controller of activeControllers) controller.abort();
+    activeControllers.clear();
     runHooks("onDestroy");
     listeners.clear();
   };

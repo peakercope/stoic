@@ -115,6 +115,14 @@ describe("store state and derived inference", () => {
     });
   });
 
+  it("actions receive a typed AbortSignal", () => {
+    plain.actions({
+      probeSignal: ({ signal }) => {
+        expectTypeOf(signal).toEqualTypeOf<AbortSignal>();
+      },
+    });
+  });
+
   it("action meta is typed", () => {
     const { inc } = plain.actions({ inc: ({ set }) => set((s) => ({ count: s.count + 1 })) });
     expectTypeOf(inc.getMeta()).toEqualTypeOf<ActionMeta>();

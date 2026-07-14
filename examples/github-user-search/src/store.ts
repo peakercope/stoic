@@ -61,25 +61,27 @@ export const search = createStore<SearchState, SearchDerived>({
 });
 
 export const { findUsers, selectUser, setSort, setLanguage, setHideForks } = search.actions({
-  findUsers: async ({ set }, query: string) => {
+  // `signal` is aborted when a newer findUsers call starts, so typing fast
+  // cancels the superseded request instead of racing it.
+  findUsers: async ({ set, signal }, query: string) => {
     const trimmed = query.trim();
     if (!trimmed) {
       set({ results: [] });
       return;
     }
-    set({ results: await api.searchUsers(trimmed) });
+    set({ results: await api.searchUsers(trimmed, signal) });
   },
 
   // Profile and repos are fetched together, then land in a single set —
-  // one recompute, one render, no half-loaded UI.
-  selectUser: async ({ set, get }, login: string) => {
+  // one recompute, one render, no half-loaded UI. Selecting another user
+  // aborts the in-flight fetches, so a stale response can never land.
+  selectUser: async ({ set, signal }, login: string) => {
     set({ selected: login, profile: null, repos: [], language: null });
 
-    const [profile, repos] = await Promise.all([api.fetchProfile(login), api.fetchRepos(login)]);
-
-    // Guard against a stale response: if another user was selected while this
-    // fetch was in flight, the newer selection wins and this result is dropped.
-    if (get().selected !== login) return;
+    const [profile, repos] = await Promise.all([
+      api.fetchProfile(login, signal),
+      api.fetchRepos(login, signal),
+    ]);
 
     set({ profile, repos });
   },

@@ -35,9 +35,10 @@ export type Repo = {
   fork: boolean;
 };
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${BASE}${path}`, {
     headers: { Accept: "application/vnd.github+json" },
+    signal,
   });
 
   if (response.ok) return (await response.json()) as T;
@@ -59,15 +60,16 @@ async function request<T>(path: string): Promise<T> {
   throw new Error(`GitHub request failed (${response.status}).`);
 }
 
-export async function searchUsers(query: string): Promise<GitHubUser[]> {
+export async function searchUsers(query: string, signal?: AbortSignal): Promise<GitHubUser[]> {
   const { items } = await request<{ items: GitHubUser[] }>(
     `/search/users?q=${encodeURIComponent(query)}&per_page=12`,
+    signal,
   );
   return items;
 }
 
-export const fetchProfile = (login: string): Promise<Profile> =>
-  request<Profile>(`/users/${encodeURIComponent(login)}`);
+export const fetchProfile = (login: string, signal?: AbortSignal): Promise<Profile> =>
+  request<Profile>(`/users/${encodeURIComponent(login)}`, signal);
 
-export const fetchRepos = (login: string): Promise<Repo[]> =>
-  request<Repo[]>(`/users/${encodeURIComponent(login)}/repos?per_page=100&sort=pushed`);
+export const fetchRepos = (login: string, signal?: AbortSignal): Promise<Repo[]> =>
+  request<Repo[]>(`/users/${encodeURIComponent(login)}/repos?per_page=100&sort=pushed`, signal);

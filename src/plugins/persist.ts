@@ -192,8 +192,7 @@ export function persist<T extends object>(options: {
     disabled = true;
     if (isDevEnv()) {
       console.warn(
-        `Stoic persist plugin: storage is unavailable for "${options.key}"; ` +
-          "persistence is disabled for this store",
+        `Stoic persist plugin: storage is unavailable for "${options.key}"; persistence is disabled for this store`,
       );
     }
   };
@@ -283,8 +282,7 @@ export function persist<T extends object>(options: {
     if (options.migrate) return options.migrate(resolve(storedState), storedVersion);
 
     console.warn(
-      `Stoic persist plugin: discarding stored state for "${options.key}" — stored version ` +
-        `${storedVersion} does not match ${options.version} and no \`migrate\` was provided`,
+      `Stoic persist plugin: discarding stored state for "${options.key}" — stored version ${storedVersion} does not match ${options.version} and no \`migrate\` was provided`,
     );
     return undefined;
   };

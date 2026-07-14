@@ -1901,6 +1901,157 @@ describe("action meta latest-call-wins", () => {
   });
 });
 
+describe("action abort signal", () => {
+  it("aborts the previous call's signal when the action is called again", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    const signals: AbortSignal[] = [];
+    let resolveFirst!: () => void;
+    const { load } = actions({
+      load: async ({ signal }) => {
+        signals.push(signal);
+        if (signals.length === 1) {
+          await new Promise<void>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+      },
+    });
+
+    const first = load();
+    const second = load();
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]?.aborted).toBe(false);
+
+    resolveFirst();
+    await Promise.all([first, second]);
+  });
+
+  it("does not abort the signal of a call that already settled", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    const signals: AbortSignal[] = [];
+    const { load } = actions({
+      load: async ({ signal }) => {
+        signals.push(signal);
+      },
+    });
+
+    await load();
+    await load();
+
+    expect(signals[0]?.aborted).toBe(false);
+    expect(signals[1]?.aborted).toBe(false);
+  });
+
+  it("aborts in-flight signals when the store is destroyed", async () => {
+    const store = createStore({ state: { value: "" } });
+    let signal!: AbortSignal;
+    let resolve!: () => void;
+    const { load } = store.actions({
+      load: async (ctx) => {
+        signal = ctx.signal;
+        await new Promise<void>((r) => {
+          resolve = r;
+        });
+      },
+    });
+
+    const pending = load();
+    expect(signal.aborted).toBe(false);
+
+    store.destroy();
+    expect(signal.aborted).toBe(true);
+
+    resolve();
+    await pending;
+  });
+
+  it("aborts independently per action", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    let signalA!: AbortSignal;
+    const signalsB: AbortSignal[] = [];
+    const resolvers: (() => void)[] = [];
+    const hang = () =>
+      new Promise<void>((resolve) => {
+        resolvers.push(resolve);
+      });
+    const { loadA, loadB } = actions({
+      loadA: async ({ signal }) => {
+        signalA = signal;
+        await hang();
+      },
+      loadB: async ({ signal }) => {
+        signalsB.push(signal);
+        await hang();
+      },
+    });
+
+    const pendingA = loadA();
+    const firstB = loadB();
+    const secondB = loadB();
+
+    // loadB's second call aborts only loadB's first signal, never loadA's.
+    expect(signalsB[0]?.aborted).toBe(true);
+    expect(signalsB[1]?.aborted).toBe(false);
+    expect(signalA.aborted).toBe(false);
+
+    for (const resolve of resolvers) resolve();
+    await Promise.all([pendingA, firstB, secondB]);
+  });
+
+  it("a call that never reads the signal does not disturb later calls", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    let signal: AbortSignal | undefined;
+    let read = false;
+    const { load } = actions({
+      load: async (ctx) => {
+        if (read) signal = ctx.signal;
+      },
+    });
+
+    await load();
+    read = true;
+    await load();
+
+    expect(signal?.aborted).toBe(false);
+  });
+
+  it("a stale call rejecting on abort does not overwrite the newer call's meta", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    let call = 0;
+    const { load } = actions({
+      load: async ({ signal }) => {
+        if (++call === 1) {
+          await new Promise<void>((_, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+      },
+    });
+
+    const first = load();
+    const firstRejection = expect(first).rejects.toMatchObject({ name: "AbortError" });
+
+    await load();
+    expect(load.getMeta().status).toBe("success");
+
+    // The aborted first call rejected and settled; its outcome must not
+    // overwrite the newer call's meta.
+    await firstRejection;
+    expect(load.getMeta().status).toBe("success");
+  });
+
+  it("exposes an unaborted signal to synchronous actions", () => {
+    const { actions } = createStore({ state: { value: "" } });
+    const { tick } = actions({
+      tick: ({ signal }) => signal.aborted,
+    });
+
+    expect(tick()).toBe(false);
+    expect(tick()).toBe(false);
+  });
+});
+
 describe("regressions", () => {
   it("action meta stays pending while an overlapping call is still in flight", async () => {
     const { actions } = createStore({ state: { value: "" } });
