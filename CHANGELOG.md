@@ -1,5 +1,11 @@
 # stoic
 
+## 0.8.1
+
+### Patch Changes
+
+- 40fb6d9: `persist` throws when given only one of `serialize`/`deserialize`. Previously the mismatch misbehaved silently: with `version` set, a custom `deserialize` without a custom `serialize` was never called (the envelope's state round-trips as a plain JSON value), and a custom `serialize` without `deserialize` fed its opaque string to `JSON.parse`. Pass both or neither.
+
 ## 0.8.0
 
 ### Minor Changes
