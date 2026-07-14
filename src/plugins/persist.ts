@@ -56,9 +56,9 @@ export function persist<T extends object>(options: {
   include?: (keyof T)[];
   /** Persist everything except these fields. Mutually exclusive with `include`. */
   exclude?: (keyof T)[];
-  /** Custom serialization; defaults to `JSON.stringify`. */
+  /** Custom serialization; defaults to `JSON.stringify`. Requires `deserialize`. */
   serialize?: (state: Partial<T>) => string;
-  /** Custom deserialization; defaults to `JSON.parse`. */
+  /** Custom deserialization; defaults to `JSON.parse`. Requires `serialize`. */
   deserialize?: (raw: string) => Partial<T>;
   /** Delay writes by this many ms, resetting the timer on each change. A pending write is flushed on destroy. */
   debounceMs?: number;
@@ -81,6 +81,12 @@ export function persist<T extends object>(options: {
 }): PersistPlugin<T> {
   if (options.include && options.exclude) {
     throw new Error("persist: pass either `include` or `exclude`, not both");
+  }
+  if ((options.serialize === undefined) !== (options.deserialize === undefined)) {
+    throw new Error(
+      "persist: pass `serialize` and `deserialize` together, or neither — with only one of " +
+        "them, the default JSON codec on the other side cannot read or write the custom format",
+    );
   }
 
   const getStorage = options.storage ?? (() => localStorage);

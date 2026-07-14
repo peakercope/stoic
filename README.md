@@ -512,7 +512,7 @@ Refresh the page and `settings` is restored automatically. `persist` accepts:
 | `migrate` | `(persisted, version) => Partial<T>` | — | Upgrade an older payload to the current shape. |
 | `skipHydration` | `boolean` | `false` | Don't hydrate at store creation; call `rehydrate()` on the plugin instance instead (see below). |
 
-`include` and `exclude` are mutually exclusive. A pending debounced write is flushed immediately if the store is destroyed. If storage is unavailable (the default `localStorage` doesn't exist on a server, for example), the plugin disables itself with a single development-only console warning instead of failing on every write.
+`include` and `exclude` are mutually exclusive, and `serialize`/`deserialize` must be provided together — `persist` throws when given only one of the pair, since the default JSON codec on the other side couldn't read or write the custom format. A pending debounced write is flushed immediately if the store is destroyed. If storage is unavailable (the default `localStorage` doesn't exist on a server, for example), the plugin disables itself with a single development-only console warning instead of failing on every write.
 
 ```tsx
 persist({

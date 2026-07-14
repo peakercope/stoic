@@ -281,6 +281,26 @@ describe("devtools", () => {
     store.destroy();
   });
 
+  it("stops sending while recording is paused and resumes on the next PAUSE_RECORDING", () => {
+    const extension = installFakeExtension();
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [devtools<{ count: number }>({})],
+    });
+
+    extension.emit({ type: "DISPATCH", payload: { type: "PAUSE_RECORDING" } });
+    store.setState({ count: 1 });
+    expect(extension.send).not.toHaveBeenCalled();
+
+    // The extension sends the same message to toggle recording back on.
+    extension.emit({ type: "DISPATCH", payload: { type: "PAUSE_RECORDING" } });
+    store.setState({ count: 2 });
+    expect(extension.send).toHaveBeenCalledTimes(1);
+    expect(extension.send).toHaveBeenCalledWith({ type: "anonymous" }, { count: 2 });
+    store.destroy();
+  });
+
   it("unsubscribes from the devtools connection on destroy", () => {
     const extension = installFakeExtension();
 

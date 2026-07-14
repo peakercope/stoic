@@ -105,6 +105,48 @@ describe("persist", () => {
     ).toThrow();
   });
 
+  it("throws if only one of serialize and deserialize is passed", () => {
+    expect(() =>
+      persist<{ theme: string }>({
+        key: "half-codec-storage",
+        serialize: (state) => JSON.stringify(state),
+      }),
+    ).toThrow("persist: pass `serialize` and `deserialize` together");
+
+    expect(() =>
+      persist<{ theme: string }>({
+        key: "half-codec-storage",
+        deserialize: (raw) => JSON.parse(raw) as { theme: string },
+      }),
+    ).toThrow("persist: pass `serialize` and `deserialize` together");
+  });
+
+  it("documents that one instance shared across stores funnels both into the same key (create one per store)", () => {
+    // Not a supported pattern — this pins what happens today so a change to
+    // the binding behavior is deliberate: the instance rebinds to the newest
+    // store, every store's writes land on the same key, and a store created
+    // later hydrates from whatever an earlier one persisted.
+    const plugin = persist<{ count: number }>({ key: "shared-instance-storage" });
+
+    const storeA = createStore({ state: { count: 0 }, plugins: [plugin] });
+    storeA.setState({ count: 1 });
+
+    const storeB = createStore({ state: { count: 100 }, plugins: [plugin] });
+    expect(storeB.getState()).toEqual({ count: 1 });
+
+    storeA.setState({ count: 2 });
+    expect(JSON.parse(localStorage.getItem("shared-instance-storage") as string)).toEqual({
+      count: 2,
+    });
+    storeB.setState({ count: 3 });
+    expect(JSON.parse(localStorage.getItem("shared-instance-storage") as string)).toEqual({
+      count: 3,
+    });
+
+    storeA.destroy();
+    storeB.destroy();
+  });
+
   it("ignores excluded keys from stored data on rehydration", () => {
     localStorage.setItem(
       "rehydrate-exclude-storage",

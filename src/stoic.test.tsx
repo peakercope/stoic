@@ -1167,6 +1167,41 @@ describe("useStore", () => {
     container.remove();
   });
 
+  it("tracks a different store when the store argument changes between renders", () => {
+    const storeA = createStore({ state: { count: 1 } });
+    const storeB = createStore({ state: { count: 10 } });
+    let latest = 0;
+
+    function Component({ store }: { store: typeof storeA }) {
+      latest = useStore(store, (s) => s.count);
+      return null;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<Component store={storeA} />));
+    expect(latest).toBe(1);
+
+    act(() => root.render(<Component store={storeB} />));
+    expect(latest).toBe(10);
+
+    // Updates to the newly-passed store are tracked...
+    act(() => {
+      storeB.setState({ count: 11 });
+    });
+    expect(latest).toBe(11);
+
+    // ...and updates to the old store no longer reach the component.
+    act(() => {
+      storeA.setState({ count: 2 });
+    });
+    expect(latest).toBe(11);
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
   it("does not re-render children when a change only touches unrelated derived values", () => {
     // Mirrors the shopping-cart example: a parent selects `items` plus a derived
     // count, while an unrelated raw key feeds a *different* derived value. The
@@ -1656,6 +1691,37 @@ describe("store.batch", () => {
   it("returns the callback's return value", () => {
     const store = createStore({ state: { count: 0 } });
     expect(store.batch(() => 42)).toBe(42);
+  });
+
+  it("coalesces an async action's post-await writes, still attributed to the action", async () => {
+    const writes: [state: unknown, actionName: string | undefined][] = [];
+    const plugin: StoicPlugin<{ a: number; b: number; c: number }> = {
+      afterSetState: (state, actionName) => writes.push([{ ...state }, actionName]),
+    };
+    const store = createStore({ state: { a: 0, b: 0, c: 0 }, plugins: [plugin] });
+    const listener = vi.fn();
+    store.subscribe(listener);
+
+    const { load } = store.actions({
+      load: async ({ set }) => {
+        set({ a: 1 });
+        await Promise.resolve();
+        store.batch(() => {
+          set({ b: 1 });
+          set({ c: 1 });
+        });
+      },
+    });
+
+    await load();
+
+    // One notification for the pre-await write, one for the whole batch.
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(writes).toEqual([
+      [{ a: 1, b: 0, c: 0 }, "load"],
+      [{ a: 1, b: 1, c: 1 }, "load"],
+    ]);
+    store.destroy();
   });
 });
 
