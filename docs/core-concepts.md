@@ -60,7 +60,7 @@ createStore({
 
 Two properties of the snapshot are worth knowing:
 
-- **Raw keys are plain data properties; derived keys are enumerable getter properties.** Reading a derived key computes it on demand (memoized until a dependency changes). This distinction is a public invariant — a plugin can rely on it to tell the two apart, as [`persist` does](./plugins/writing-a-plugin.md#telling-derived-keys-apart).
+- **Derived keys start as enumerable getters and memoize themselves into plain data properties on first read.** Reading a derived key computes it on demand; repeat reads on the same snapshot are ordinary property accesses. Either way the key is own and enumerable, so spreads, `Object.keys`, and `JSON.stringify` see derived values alongside raw state — but property descriptors are *not* a way to tell the two apart (see [Telling derived keys apart](./plugins/writing-a-plugin.md#telling-derived-keys-apart)).
 - **Snapshots are replaced, not mutated.** An update that changes nothing keeps the same snapshot reference, so subscribers are not notified. This is what lets `useStore` skip rerenders, and it is why you should [update state immutably](./derived-state.md#what-dependency-tracking-sees).
 
 ## Where to go next

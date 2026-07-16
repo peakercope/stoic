@@ -30,7 +30,7 @@ In development, React StrictMode double-invokes store factories, so `onInit` can
 
 ### `beforeAction(ctx)` / `afterAction(ctx)`
 
-Called around every action call, with `{ name, args, state }`. `afterAction` still runs if the action throws or rejects.
+Called around every action call, with `{ name, args, state }` (the `ActionEvent` type). `afterAction` still runs if the action throws or rejects — but not if it settles after the store was destroyed, since `onDestroy` has already run by then.
 
 ### `afterSetState(state, actionName?, actionArgs?)`
 
@@ -52,4 +52,4 @@ Called when `store.destroy()` is called.
 
 ## Telling derived keys apart
 
-A plugin that needs to tell raw state apart from derived values (as [`persist`](./persist.md) does) can inspect the snapshot: derived keys are exposed as enumerable getter properties, raw keys as plain data properties — `Object.getOwnPropertyDescriptor(store.getState(), key)?.get` is set exactly for derived keys, and checking it doesn't trigger any computation.
+Snapshot property descriptors can't distinguish raw state from derived values: a derived key starts as a getter but memoizes itself into a plain data property the first time it's read. A plugin that needs the distinction (as [`persist`](./persist.md) does) should take the derived key list — or the keys it operates on — as an option from its user, who knows the store's configuration.

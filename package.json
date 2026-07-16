@@ -24,6 +24,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./plugins": "./dist/plugins.js",
+    "./plugins/devtools": "./dist/plugins/devtools.js",
+    "./plugins/persist": "./dist/plugins/persist.js",
     "./react": "./dist/react.js",
     "./tools": "./dist/tools.js",
     "./package.json": "./package.json"

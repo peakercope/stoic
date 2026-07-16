@@ -72,4 +72,6 @@ function CartSummary() {
 
 The store is destroyed when its `Provider` unmounts, so plugins get their `onDestroy` (a pending debounced [`persist`](./plugins/persist.md) write is flushed). This is StrictMode-safe: React's mount → unmount → mount cycle in development does not tear down the store.
 
+This automatic destroy is the main reason to reach for `createStoreContext` even in client-only apps that render one Provider: `destroy()` is what detaches the store from the outside world — it flushes a pending `persist` write, unsubscribes the persist driver's cross-tab listener, aborts in-flight action signals, and disconnects `devtools`. A store built ad hoc in component state would leak those on unmount.
+
 Inside React's [`<Activity>`](https://react.dev/reference/react/Activity) (React 19.2+), hiding a subtree behaves like an unmount for the store: it is destroyed — flushing plugins — and a fresh one is created when the subtree is revealed. In-memory state does not survive a hide; pair the store with `persist` if it should.

@@ -1,5 +1,5 @@
 import { isDevEnv } from "../env";
-import type { StoicPlugin, StoicStore } from "../stoic";
+import { derivedKeysOf, type StoicPlugin, type StoicStore } from "../stoic";
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -182,7 +182,6 @@ export function persist<T extends object>(options: {
   let disabled = false;
   let unsubscribe: (() => void) | undefined;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-  let pendingState: T | undefined;
 
   // Set when the backend can't be reached at all (e.g. the default
   // `localStorage` on a server), which disables the plugin after a single
@@ -251,10 +250,8 @@ export function persist<T extends object>(options: {
   const readPayload = (raw: string): Partial<T> | undefined => {
     if (options.version === undefined) return doDeserialize(raw);
 
-    // A payload written before versioning was enabled is a bare state string
-    // and counts as version 0; so does one written by a custom serializer.
     let storedVersion = 0;
-    let storedState: unknown = raw;
+    let storedState: Partial<T> | undefined;
     try {
       const envelope = JSON.parse(raw) as {
         version?: unknown;
@@ -267,19 +264,20 @@ export function persist<T extends object>(options: {
         "state" in envelope
       ) {
         storedVersion = envelope.version;
-        storedState = envelope.state;
+        // A custom codec embeds the serialized state as an opaque string; the
+        // default codec stores the state value itself.
+        storedState = options.deserialize
+          ? options.deserialize(envelope.state as string)
+          : (envelope.state as Partial<T>);
       }
     } catch {
-      // Not JSON at the envelope level: legacy payload from a custom serializer.
+      // Not JSON at the envelope level; treated as a bare payload below.
     }
+    // A payload without an envelope predates versioning and counts as version 0.
+    if (storedState === undefined) storedState = doDeserialize(raw);
 
-    // A string is a serialized state — from a custom serializer, that embedded the default-serialized state as a string.
-    // Anything else is the state value itself.
-    const resolve = (value: unknown): Partial<T> =>
-      typeof value === "string" ? doDeserialize(value) : (value as Partial<T>);
-
-    if (storedVersion === options.version) return resolve(storedState);
-    if (options.migrate) return options.migrate(resolve(storedState), storedVersion);
+    if (storedVersion === options.version) return storedState;
+    if (options.migrate) return options.migrate(storedState, storedVersion);
 
     console.warn(
       `Stoic persist plugin: discarding stored state for "${options.key}" — stored version ${storedVersion} does not match ${options.version} and no \`migrate\` was provided`,
@@ -357,15 +355,7 @@ export function persist<T extends object>(options: {
   return {
     onInit(store) {
       boundStore = store;
-      // Derived values are exposed as getter properties on snapshots (a
-      // documented invariant of the core, pinned by its tests); raw keys are
-      // plain data properties. Inspecting descriptors doesn't compute anything.
-      const snapshot = store.getState();
-      derivedKeys = new Set(
-        Object.keys(snapshot).filter(
-          (key) => Object.getOwnPropertyDescriptor(snapshot, key)?.get !== undefined,
-        ),
-      );
+      derivedKeys = new Set(derivedKeysOf(store));
 
       for (const key of options.include ?? []) {
         if (derivedKeys.has(key as string)) {
@@ -404,12 +394,14 @@ export function persist<T extends object>(options: {
       if (hydrating || disabled) return;
 
       if (options.debounceMs !== undefined) {
-        pendingState = state;
         if (debounceTimer !== undefined) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
           debounceTimer = undefined;
-          pendingState = undefined;
-          writeToStorage(state);
+          // Read the state at fire time: `sync` or `rehydrate()` may have
+          // applied newer state since this write was scheduled (their writes
+          // don't reschedule the timer), and persisting the captured snapshot
+          // would clobber it.
+          if (boundStore !== undefined) writeToStorage(boundStore.getState());
         }, options.debounceMs);
         return;
       }
@@ -420,12 +412,13 @@ export function persist<T extends object>(options: {
       destroyed = true;
       unsubscribe?.();
       unsubscribe = undefined;
-      queued = undefined;
+      // `queued` is deliberately left alone: a state coalesced behind an
+      // in-flight async write is the store's final state, and the in-flight
+      // write's completion flushes it.
       if (debounceTimer !== undefined) {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
-        writeToStorage(pendingState as T);
-        pendingState = undefined;
+        if (boundStore !== undefined) writeToStorage(boundStore.getState());
       }
     },
   };

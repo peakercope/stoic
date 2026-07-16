@@ -19,10 +19,6 @@ export class CircularDependencyError extends Error {
   }
 }
 
-const warn = (message: string) => {
-  if (isDevEnv()) console.warn(message);
-};
-
 /**
  * Merges a partial state — or the result of an updater that receives the
  * current state, derived values included — into the store. Only raw state
@@ -108,7 +104,7 @@ export type StoicStore<T, Full = T> = {
 };
 
 /** What `beforeAction`/`afterAction` hooks receive about the running action. */
-export type ActionContext<Full = unknown> = {
+export type ActionEvent<Full = unknown> = {
   name: string;
   args: unknown[];
   state: Full;
@@ -128,9 +124,13 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
    */
   onInit?(store: StoicStore<T, Full>): void;
   /** Called before every action invocation. */
-  beforeAction?(ctx: ActionContext<Full>): void;
-  /** Called after every action settles — also when it throws or rejects. */
-  afterAction?(ctx: ActionContext<Full>): void;
+  beforeAction?(event: ActionEvent<Full>): void;
+  /**
+   * Called after every action settles — also when it throws or rejects, but
+   * not when it settles after the store was destroyed (`onDestroy` has run
+   * by then).
+   */
+  afterAction?(event: ActionEvent<Full>): void;
   /**
    * `actionName` is the action whose `ctx.set` produced the change (also
    * across `await`s), or `undefined` for a direct `store.setState`. For a
@@ -147,15 +147,25 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
 // (key, value-at-compute-time) pairs from the most recent compute; that compute
 // is fresh for a snapshot when every recorded dep value is still `Object.is`-
 // equal on that snapshot (reading a derived dep recurses through its own
-// getter, so invalidation is transitive). `cache` pins the resolved value per
-// snapshot, so code holding an older snapshot reads a stable, correct value
-// without thrashing the shared dep record.
+// getter, so invalidation is transitive). The resolved value is pinned per
+// snapshot by replacing the snapshot's getter with a data property, so code
+// holding an older snapshot reads a stable, correct value without thrashing
+// the shared dep record — and repeat reads are plain property accesses.
 type Cell = {
   value: unknown;
   deps: [key: string, value: unknown][] | null;
-  cache: WeakMap<object, unknown>;
   computing: boolean;
 };
+
+// The internal contract between the core and the first-party plugins: the
+// store carries its derived key list under a module-private symbol. Plugins
+// can't inspect snapshot property descriptors instead — derived getters
+// self-memoize into plain data properties on first read.
+const DERIVED_KEYS = Symbol("stoic.derivedKeys");
+
+/** @internal Not part of the public API. */
+export const derivedKeysOf = (store: object): readonly string[] =>
+  (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS] ?? [];
 
 /**
  * Creates a store from initial `state`, optional `derived` values, and
@@ -215,16 +225,22 @@ export function createStore<T extends object, D extends object = Record<never, n
     cells[key] = {
       value: undefined,
       deps: null,
-      cache: new WeakMap(),
       computing: false,
     };
   }
   // Path of derived keys currently being computed, for cycle error messages.
   const computeStack: string[] = [];
 
+  // Replaces the snapshot's getter for `key` with the resolved value. On an
+  // existing configurable property, defineProperty leaves omitted attributes
+  // alone, so the pinned property stays enumerable (and non-writable, like the
+  // setter-less getter it replaces).
+  const pin = (snap: Full, key: string, value: unknown) => {
+    Object.defineProperty(snap, key, { value });
+  };
+
   const readDerived = (key: string, snap: Full): unknown => {
     const cell = cells[key] as Cell;
-    if (cell.cache.has(snap)) return cell.cache.get(snap);
     if (cell.computing) {
       throw new CircularDependencyError([...computeStack.slice(computeStack.indexOf(key)), key]);
     }
@@ -243,7 +259,7 @@ export function createStore<T extends object, D extends object = Record<never, n
           }
         }
         if (fresh) {
-          cell.cache.set(snap, cell.value);
+          pin(snap, key, cell.value);
           return cell.value;
         }
       }
@@ -268,7 +284,7 @@ export function createStore<T extends object, D extends object = Record<never, n
       });
       cell.value = (derivedFns[key] as (s: Full) => unknown)(tracked as Full);
       cell.deps = deps;
-      cell.cache.set(snap, cell.value);
+      pin(snap, key, cell.value);
       return cell.value;
     } finally {
       cell.computing = false;
@@ -299,9 +315,12 @@ export function createStore<T extends object, D extends object = Record<never, n
   let snapshot = makeSnapshot(raw);
   let destroyed = false;
 
-  // Evaluate every derived key once so a statically cyclic config fails at
-  // creation instead of on first read.
-  for (const key of derivedKeys) readDerived(key, snapshot);
+  // Dev-only: evaluate every derived key once so a statically cyclic config
+  // fails at creation instead of on first read. Production skips the eager
+  // pass — derived values stay lazy and a cycle still throws on read.
+  if (isDevEnv()) {
+    for (const key of derivedKeys) readDerived(key, snapshot);
+  }
 
   const getState = () => snapshot;
 
@@ -323,8 +342,8 @@ export function createStore<T extends object, D extends object = Record<never, n
   let notifyDepth = 0;
 
   const notify = (actionName?: string, actionArgs?: readonly unknown[]) => {
-    if (notifyDepth > 0) {
-      warn(
+    if (notifyDepth > 0 && isDevEnv()) {
+      console.warn(
         "stoic: re-entrant setState detected — a plugin or subscriber updated state while a " +
           "notification was in progress. Prefer derived state or batching over update loops.",
       );
@@ -347,7 +366,7 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const setState: SetState<T, Full> = (partial) => {
     if (destroyed) {
-      warn("stoic: setState called on a destroyed store; ignored");
+      if (isDevEnv()) console.warn("stoic: setState called on a destroyed store; ignored");
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
@@ -355,7 +374,9 @@ export function createStore<T extends object, D extends object = Record<never, n
     let nextRaw: T | null = null;
     for (const key of Object.keys(next)) {
       if (Object.hasOwn(cells, key)) {
-        warn(`stoic: setState ignored derived key "${key}"; derived values are computed`);
+        if (isDevEnv()) {
+          console.warn(`stoic: setState ignored derived key "${key}"; derived values are computed`);
+        }
         continue;
       }
       const value = (next as Record<string, unknown>)[key];
@@ -396,7 +417,7 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const subscribe = (listener: Listener<Full>) => {
     if (destroyed) {
-      warn("stoic: subscribe called on a destroyed store; ignored");
+      if (isDevEnv()) console.warn("stoic: subscribe called on a destroyed store; ignored");
       return () => {};
     }
     listeners.add(listener);
@@ -443,7 +464,9 @@ export function createStore<T extends object, D extends object = Record<never, n
           activeControllers.delete(controller);
           currentController = null;
         }
-        runHooks("afterAction", { name, args, state: getState() });
+        // Not after destroy: onDestroy already ran, so plugins must not be
+        // observed again. Meta still settles — handles outlive the store.
+        if (!destroyed) runHooks("afterAction", { name, args, state: getState() });
         setMeta(callId, outcome);
       };
 
@@ -513,14 +536,18 @@ export function createStore<T extends object, D extends object = Record<never, n
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
     const result: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(map)) {
-      if (registeredActionNames.has(name)) {
-        warn(
-          `stoic: action "${name}" is already registered on this store. Each actions() call ` +
-            "builds new handles with fresh, independent status meta — create handles once " +
-            "(at module or factory level) and reuse them.",
-        );
+      // Dev-only bookkeeping: the registry exists purely to power this warning,
+      // so production never grows the Set.
+      if (isDevEnv()) {
+        if (registeredActionNames.has(name)) {
+          console.warn(
+            `stoic: action "${name}" is already registered on this store. Each actions() call ` +
+              "builds new handles with fresh, independent status meta — create handles once " +
+              "(at module or factory level) and reuse them.",
+          );
+        }
+        registeredActionNames.add(name);
       }
-      registeredActionNames.add(name);
       result[name] = createActionRunner(name, fn);
     }
     return result;
@@ -543,6 +570,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     batch,
     destroy,
   };
+  Object.defineProperty(store, DERIVED_KEYS, { value: derivedKeys });
 
   runHooks("onInit", store);
 

@@ -1,6 +1,6 @@
 export type {
-  ActionContext,
   ActionCtx,
+  ActionEvent,
   ActionHandle,
   ActionMeta,
   ActionStatus,

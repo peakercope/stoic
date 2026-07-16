@@ -249,26 +249,34 @@ describe("derived", () => {
     expect(label).not.toHaveBeenCalled();
   });
 
-  it("exposes derived keys as enumerable getters on snapshots, raw keys as data properties", () => {
-    // Contract relied on by plugins (persist, devtools) to tell raw state
-    // apart from computed values without evaluating them.
+  it("exposes a derived key as a lazy enumerable getter that self-memoizes into a data property on first read", () => {
     const doubled = vi.fn((s: { count: number }) => s.count * 2);
-    const { getState } = createStore<{ count: number }, { doubled: number }>({
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
       state: { count: 3 },
       derived: { doubled },
     });
-    doubled.mockClear();
 
+    // A fresh snapshot (past the dev-only eager pass at creation) exposes the
+    // derived key as an enumerable getter; inspecting it computes nothing.
+    setState({ count: 4 });
     const snapshot = getState();
-    const derivedDesc = Object.getOwnPropertyDescriptor(snapshot, "doubled");
-    const rawDesc = Object.getOwnPropertyDescriptor(snapshot, "count");
-
-    expect(derivedDesc?.get).toBeTypeOf("function");
-    expect(derivedDesc?.enumerable).toBe(true);
-    expect(rawDesc?.get).toBeUndefined();
-    expect(rawDesc?.value).toBe(3);
-    // Inspecting descriptors must not force computation.
+    doubled.mockClear();
+    const before = Object.getOwnPropertyDescriptor(snapshot, "doubled");
+    expect(before?.get).toBeTypeOf("function");
+    expect(before?.enumerable).toBe(true);
     expect(doubled).not.toHaveBeenCalled();
+
+    // The first read pins the value as a plain enumerable data property, so
+    // repeat reads on this snapshot are plain property accesses.
+    expect(snapshot.doubled).toBe(8);
+    const after = Object.getOwnPropertyDescriptor(snapshot, "doubled");
+    expect(after?.get).toBeUndefined();
+    expect(after?.value).toBe(8);
+    expect(after?.enumerable).toBe(true);
+
+    const rawDesc = Object.getOwnPropertyDescriptor(snapshot, "count");
+    expect(rawDesc?.get).toBeUndefined();
+    expect(rawDesc?.value).toBe(4);
   });
 
   it("tracks non-string (symbol) property reads on the proxied state without adding them as dependencies", () => {
@@ -537,6 +545,19 @@ describe("circular dependency detection", () => {
     setState({ flag: true });
 
     expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
+  });
+
+  it("defers the creation-time check to the first read in production builds", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      const store = createStore<{ a: number }, { b: number; c: number }>({
+        state: { a: 1 },
+        derived: { b: (s) => s.c, c: (s) => s.b },
+      });
+      expect(() => store.getState().b).toThrow(CircularDependencyError);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("does not throw for a non-cyclic diamond of dependencies", () => {
@@ -989,6 +1010,30 @@ describe("plugins", () => {
       ["after", "fail"],
     ]);
     store.destroy();
+  });
+
+  it("does not call afterAction for an action that settles after destroy()", async () => {
+    const afterAction = vi.fn();
+    const onDestroy = vi.fn();
+    const plugin: StoicPlugin<{ count: number }> = { afterAction, onDestroy };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { slow } = store.actions({
+      slow: async () => {
+        await gate;
+      },
+    });
+
+    const pending = slow();
+    store.destroy();
+    release();
+    await pending;
+
+    expect(onDestroy).toHaveBeenCalledOnce();
+    expect(afterAction).not.toHaveBeenCalled();
   });
 
   it("calls onDestroy and stops notifying listeners after destroy()", () => {

@@ -1,6 +1,6 @@
 import type {} from "@redux-devtools/extension";
 import { isDevEnv } from "../env";
-import type { StoicPlugin, StoicStore } from "../stoic";
+import { derivedKeysOf, type StoicPlugin, type StoicStore } from "../stoic";
 
 export interface DevtoolsOptions {
   /** Instance name in the DevTools dropdown; defaults to an auto-generated per-store name. */
@@ -74,11 +74,7 @@ export function devtools<T extends object, Full extends object = T>(
     onInit(s) {
       store = s;
       initialState = s.getState();
-      // Derived values are getter properties on snapshots (core invariant);
-      // raw keys are plain data properties.
-      derivedKeys = Object.keys(initialState).filter(
-        (key) => Object.getOwnPropertyDescriptor(initialState, key)?.get !== undefined,
-      );
+      derivedKeys = derivedKeysOf(s);
 
       if (!enabled) return;
       const extension =

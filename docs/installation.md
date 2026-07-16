@@ -20,7 +20,7 @@ The package has four entry points:
 | --- | --- |
 | `stoic-store` | `createStore` and the store itself. **React-free** — safe to import anywhere, including React Server Components. |
 | `stoic-store/react` | The hooks: `useStore`, `useActionMeta`, and `createStoreContext`. |
-| `stoic-store/plugins` | The built-in `persist` and `devtools` plugins. |
+| `stoic-store/plugins` | The built-in `persist` and `devtools` plugins. Each is also importable on its own from `stoic-store/plugins/persist` and `stoic-store/plugins/devtools`. |
 | `stoic-store/tools` | The `shallow` equality helper. |
 
 Every export of every entry point is listed in the [API Reference](./api-reference.md).

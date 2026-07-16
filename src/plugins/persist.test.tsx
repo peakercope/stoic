@@ -371,6 +371,35 @@ describe("persist", () => {
       store.destroy();
     });
 
+    it("does not clobber newer synced state when a pending debounced write fires", () => {
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [
+          persist<{ count: number }>({ key: "debounce-sync", sync: true, debounceMs: 100 }),
+        ],
+      });
+
+      store.setState({ count: 1 });
+
+      // Another tab writes before the timer fires; the store applies it.
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "debounce-sync",
+          newValue: JSON.stringify({ count: 2 }),
+          storageArea: localStorage,
+        }),
+      );
+      expect(store.getState()).toEqual({ count: 2 });
+
+      vi.advanceTimersByTime(100);
+
+      // The debounced write must persist the store's current state, not the
+      // pre-sync snapshot it was scheduled with — that would revert the other
+      // tab and diverge this store from storage.
+      expect(localStorage.getItem("debounce-sync")).toBe(JSON.stringify({ count: 2 }));
+      store.destroy();
+    });
+
     it("flushes a pending debounced write immediately on destroy", () => {
       const store = createStore({
         state: { count: 0 },
@@ -480,24 +509,6 @@ describe("persist", () => {
       store.destroy();
     });
 
-    it("rehydrates a pre-1.0 envelope whose state is an escaped JSON string", () => {
-      // Written by stoic-store <= 0.6, which double-serialized the state.
-      localStorage.setItem(
-        "versioned-legacy-envelope-storage",
-        JSON.stringify({ version: 3, state: JSON.stringify({ count: 9 }) }),
-      );
-
-      const store = createStore({
-        state: { count: 0 },
-        plugins: [
-          persist<{ count: number }>({ key: "versioned-legacy-envelope-storage", version: 3 }),
-        ],
-      });
-
-      expect(store.getState().count).toBe(9);
-      store.destroy();
-    });
-
     it("runs migrate on an older payload and hydrates its result", () => {
       localStorage.setItem(
         "versioned-migrate-storage",
@@ -511,31 +522,6 @@ describe("persist", () => {
         state: { count: 0 },
         plugins: [
           persist<{ count: number }>({ key: "versioned-migrate-storage", version: 2, migrate }),
-        ],
-      });
-
-      expect(migrate).toHaveBeenCalledWith({ count: "7" }, 1);
-      expect(store.getState().count).toBe(7);
-      store.destroy();
-    });
-
-    it("runs migrate on an older pre-1.0 string-state envelope", () => {
-      localStorage.setItem(
-        "versioned-migrate-legacy-storage",
-        JSON.stringify({ version: 1, state: JSON.stringify({ count: "7" }) }),
-      );
-      const migrate = vi.fn((persisted: unknown) => ({
-        count: Number((persisted as { count: string }).count),
-      }));
-
-      const store = createStore({
-        state: { count: 0 },
-        plugins: [
-          persist<{ count: number }>({
-            key: "versioned-migrate-legacy-storage",
-            version: 2,
-            migrate,
-          }),
         ],
       });
 
@@ -806,6 +792,27 @@ describe("persist", () => {
         expect(writes).toEqual([JSON.stringify({ count: 1 }), JSON.stringify({ count: 3 })]);
       });
       store.destroy();
+    });
+
+    it("still writes a state queued behind an in-flight write when the store is destroyed", async () => {
+      const { driver, writes } = asyncDriver();
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "async", driver })],
+      });
+      await vi.waitFor(() => {
+        expect(writes).toEqual([]);
+      });
+
+      store.setState({ count: 1 });
+      store.setState({ count: 2 });
+      store.destroy();
+
+      await vi.waitFor(() => {
+        // count: 2 was queued behind the in-flight count: 1 write when destroy
+        // ran; dropping it would silently lose the store's final state.
+        expect(writes).toEqual([JSON.stringify({ count: 1 }), JSON.stringify({ count: 2 })]);
+      });
     });
 
     it("ignores a read that resolves after the store is destroyed", async () => {

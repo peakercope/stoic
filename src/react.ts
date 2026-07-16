@@ -132,6 +132,11 @@ export function createStoreContext<T extends object, Full extends object, A, P =
       destroyed: false,
     }));
 
+    // Pinned to the first render's value (like the store itself), so an
+    // unstable inline `init` prop doesn't re-run the teardown effect on every
+    // render just to build the same store on a post-hide reveal.
+    const initRef = useRef(init);
+
     useEffect(() => {
       // A remount cancels a destroy scheduled by the preceding cleanup. React's
       // StrictMode runs effects mount → unmount → mount, so an inline destroy
@@ -145,7 +150,7 @@ export function createStoreContext<T extends object, Full extends object, A, P =
       // out would freeze the subtree. Build a fresh instance instead — hide is
       // a real teardown, reveal a fresh start; `persist` rehydrates it.
       if (instance.destroyed) {
-        setInstance({ ...factory(init as P), pendingDestroy: false, destroyed: false });
+        setInstance({ ...factory(initRef.current as P), pendingDestroy: false, destroyed: false });
         return;
       }
 
@@ -158,7 +163,7 @@ export function createStoreContext<T extends object, Full extends object, A, P =
           }
         });
       };
-    }, [instance, init]);
+    }, [instance]);
 
     return createElement(Ctx.Provider, { value: instance }, children);
   }

@@ -55,13 +55,13 @@ Tracking is **per top-level state key**. A derived function that reads `s.items`
 1. **Update state immutably.** Mutating an array in place (`s.items.push(...)`) keeps the same reference, so nothing downstream recomputes. Every example in these docs produces a new array/object instead.
 2. **Read inputs as properties** (`s.count`); dependency tracking doesn't see `Object.keys(s)` or `"count" in s`.
 
-Derived values are computed **lazily**: a derived key does its work the first time it's read after a relevant change, and the result is memoized until a dependency actually changes. Declaration order doesn't matter — a derived key can freely read another derived key declared before or after it; reads resolve recursively through the dependency graph. (The one exception to laziness: every derived key is evaluated once at store creation, so a statically cyclic configuration fails immediately.)
+Derived values are computed **lazily**: a derived key does its work the first time it's read after a relevant change, and the result is memoized until a dependency actually changes. Declaration order doesn't matter — a derived key can freely read another derived key declared before or after it; reads resolve recursively through the dependency graph. (The one exception to laziness: in development builds, every derived key is evaluated once at store creation so a statically cyclic configuration fails immediately; production builds skip that pass and stay fully lazy.)
 
 > Derived functions should be **pure** — no side effects, no reading clocks or randomness. An impure derived value only recomputes when its tracked dependencies change, so anything else it reads goes stale silently.
 
 ## Rules and errors
 
-> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle — at store creation if the cycle is always present, or on the read of the cyclic value if it only appears for certain states.
+> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle — in development at store creation if the cycle is always present, otherwise on the read of the cyclic value.
 
 > A key can't be both state and derived: `createStore` throws if `state` and `derived` share a key, since the derived getter would silently shadow the state value.
 

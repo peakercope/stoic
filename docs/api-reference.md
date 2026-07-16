@@ -53,7 +53,7 @@ After `destroy()`, `setState` and `subscribe` are no-ops with a development warn
 
 ### `CircularDependencyError`
 
-Thrown when derived values depend on each other in a cycle, with a message describing the cycle — at store creation if the cycle is always present, or on the read of the cyclic value if it only appears for certain states.
+Thrown when derived values depend on each other in a cycle, with a message describing the cycle — in development at store creation if the cycle is always present, otherwise on the read of the cyclic value.
 
 ## `stoic-store/react`
 
@@ -148,7 +148,7 @@ type ActionCtx<T, Full = T> = {
 };
 
 /** What plugin `beforeAction` / `afterAction` hooks receive. */
-type ActionContext<Full = unknown> = {
+type ActionEvent<Full = unknown> = {
   name: string;
   args: unknown[];
   state: Full;
@@ -170,8 +170,8 @@ type StoicStore<T, Full = T> = {
 
 interface StoicPlugin<T extends object = object, Full extends object = T> {
   onInit?(store: StoicStore<T, Full>): void;
-  beforeAction?(ctx: ActionContext<Full>): void;
-  afterAction?(ctx: ActionContext<Full>): void;
+  beforeAction?(event: ActionEvent<Full>): void;
+  afterAction?(event: ActionEvent<Full>): void;
   afterSetState?(state: Full, actionName?: string, actionArgs?: readonly unknown[]): void;
   onDestroy?(): void;
 }
