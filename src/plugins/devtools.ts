@@ -56,6 +56,16 @@ export function devtools<T extends object, Full extends object = T>(
   let isRecording = true;
   let derivedKeys: readonly string[] = [];
 
+  // Derived getters live on the snapshot's prototype and the extension
+  // serializes only own enumerable keys, so unread derived values would be
+  // missing from the devtools display. Reading each key materializes it.
+  const materialize = (state: Full): Full => {
+    if (derivedKeys.length === 0) return state;
+    const full = { ...state } as Record<string, unknown>;
+    for (const key of derivedKeys) full[key] = (state as Record<string, unknown>)[key];
+    return full as Full;
+  };
+
   const setStateFromDevtools = (state: Full) => {
     if (!store) return;
     // Serialized devtools payloads include derived values; they are computed
@@ -73,8 +83,8 @@ export function devtools<T extends object, Full extends object = T>(
   return {
     onInit(s) {
       store = s;
-      initialState = s.getState();
       derivedKeys = derivedKeysOf(s);
+      initialState = materialize(s.getState());
 
       if (!enabled) return;
       const extension =
@@ -101,13 +111,13 @@ export function devtools<T extends object, Full extends object = T>(
             return;
           }
           case "COMMIT": {
-            connection?.init(store.getState());
+            connection?.init(materialize(store.getState()));
             return;
           }
           case "ROLLBACK": {
             if (!message.state) return;
             setStateFromDevtools(JSON.parse(message.state) as Full);
-            connection?.init(store.getState());
+            connection?.init(materialize(store.getState()));
             return;
           }
           case "IMPORT_STATE": {
@@ -115,7 +125,7 @@ export function devtools<T extends object, Full extends object = T>(
             const lastComputedState = computedStates?.slice(-1)[0]?.state;
             if (!lastComputedState) return;
             setStateFromDevtools(lastComputedState as Full);
-            connection?.init(store.getState());
+            connection?.init(materialize(store.getState()));
             return;
           }
           case "PAUSE_RECORDING": {
@@ -133,7 +143,7 @@ export function devtools<T extends object, Full extends object = T>(
       // Args are sent by reference (like Redux): the extension serializes them
       // on receipt. `args` is absent — not empty — for a direct `store.setState`,
       // which has no action and therefore no arguments.
-      connection.send(actionArgs ? { type, args: [...actionArgs] } : { type }, state);
+      connection.send(actionArgs ? { type, args: [...actionArgs] } : { type }, materialize(state));
     },
     onDestroy() {
       connection?.unsubscribe();

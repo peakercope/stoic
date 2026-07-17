@@ -12,6 +12,10 @@ import type { ActionMeta, StoicStore } from "./stoic";
 
 const UNSET = Symbol("stoic.unset");
 
+// Hoisted: a default parameter expression is re-evaluated on every call, so an
+// inline arrow default would allocate a closure per render.
+const identity = (s: unknown) => s;
+
 /** The part of a store `useStore` reads; any `StoicStore` satisfies it. */
 type ReadableStore<Full> = {
   getState: () => Full;
@@ -27,7 +31,7 @@ type ReadableStore<Full> = {
  */
 export function useStore<Full extends object, U = Full>(
   store: ReadableStore<Full>,
-  selector: (state: Full) => U = (s) => s as unknown as U,
+  selector: (state: Full) => U = identity as (state: Full) => U,
   equality: (a: U, b: U) => boolean = Object.is,
 ): U {
   // Sentinel-gated so the selector doesn't run on every render just to

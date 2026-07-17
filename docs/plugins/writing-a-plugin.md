@@ -52,4 +52,4 @@ Called when `store.destroy()` is called.
 
 ## Telling derived keys apart
 
-Snapshot property descriptors can't distinguish raw state from derived values: a derived key starts as a getter but memoizes itself into a plain data property the first time it's read. A plugin that needs the distinction (as [`persist`](./persist.md) does) should take the derived key list — or the keys it operates on — as an option from its user, who knows the store's configuration.
+Snapshot property descriptors can't distinguish raw state from derived values: a derived key starts as a getter on the snapshot's prototype (not an own property at all) and memoizes itself into a plain own data property the first time it's read. A plugin that needs the distinction (as [`persist`](./persist.md) does) should take the derived key list — or the keys it operates on — as an option from its user, who knows the store's configuration.

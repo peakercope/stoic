@@ -144,24 +144,77 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
 }
 
 // One memoization cell per derived key, shared across snapshots. `deps` records
-// (key, value-at-compute-time) pairs from the most recent compute; that compute
-// is fresh for a snapshot when every recorded dep value is still `Object.is`-
-// equal on that snapshot (reading a derived dep recurses through its own
-// getter, so invalidation is transitive). The resolved value is pinned per
-// snapshot by replacing the snapshot's getter with a data property, so code
-// holding an older snapshot reads a stable, correct value without thrashing
-// the shared dep record — and repeat reads are plain property accesses.
+// (key, value-at-compute-time) pairs — flattened as [k0, v0, k1, v1, …] — from
+// the most recent compute; that compute is fresh for a snapshot when every
+// recorded dep value is still `Object.is`-equal on that snapshot (reading a
+// derived dep recurses through its own getter, so invalidation is transitive).
+// `derivedDeps` is set when any recorded dep is itself derived: only those
+// freshness checks can recurse, so raw-only cells skip the cycle guard. The
+// resolved value is pinned per snapshot as an own data property shadowing the
+// shared prototype getter, so code holding an older snapshot reads a stable,
+// correct value without thrashing the shared dep record — and repeat reads are
+// plain property accesses.
 type Cell = {
   value: unknown;
-  deps: [key: string, value: unknown][] | null;
+  deps: unknown[] | null;
+  derivedDeps: boolean;
   computing: boolean;
+};
+
+// Adding an own property is a fast shape transition; redefining one (the old
+// design) drops the object into dictionary mode. Every dep value is re-read on
+// each freshness check, so `deps` stays deduped.
+const isFresh = (deps: unknown[], snap: Record<string, unknown>): boolean => {
+  for (let i = 0; i < deps.length; i += 2) {
+    if (!Object.is(deps[i + 1], snap[deps[i] as string])) return false;
+  }
+  return true;
 };
 
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
-// can't inspect snapshot property descriptors instead — derived getters
-// self-memoize into plain data properties on first read.
+// can't inspect snapshot property descriptors instead — derived getters live
+// on a shared prototype and self-memoize into plain data properties on read.
 const DERIVED_KEYS = Symbol("stoic.derivedKeys");
+
+// Every snapshot carries its store's readDerived under this symbol, so the
+// prototype getters need nothing store-specific and one prototype serves every
+// store built from the same `derived` config. That sharing is what makes the
+// cache below worth having: V8 keys hidden classes by prototype, so a fresh
+// prototype per store would force a fresh shape tree for its snapshots —
+// roughly a microsecond per store — while factory-created stores (contexts,
+// tests, one store per request) reuse the cached prototype's tree for free.
+const READ_DERIVED = Symbol("stoic.readDerived");
+
+type ReadDerived = (key: string, snap: object) => unknown;
+type WithRead = { [READ_DERIVED]: ReadDerived };
+
+// Reused (synchronously, in full) for every snapshot: the slot must be
+// non-enumerable so it stays out of spreads, Object.assign, and deep-equality
+// — which rules out plain assignment — and reusing one descriptor object keeps
+// the per-snapshot cost to the defineProperty call itself.
+const READ_DESC: { value: ReadDerived | undefined } = { value: undefined };
+
+const PROTO_CACHE = new WeakMap<object, object>();
+
+const protoFor = (derivedConfig: object, derivedKeys: string[]): object => {
+  let proto = PROTO_CACHE.get(derivedConfig);
+  if (proto === undefined) {
+    const descriptors: PropertyDescriptorMap = {};
+    for (const key of derivedKeys) {
+      descriptors[key] = {
+        enumerable: true,
+        configurable: true,
+        get(this: WithRead) {
+          return this[READ_DERIVED](key, this);
+        },
+      };
+    }
+    proto = Object.defineProperties({}, descriptors);
+    PROTO_CACHE.set(derivedConfig, proto);
+  }
+  return proto;
+};
 
 /** @internal Not part of the public API. */
 export const derivedKeysOf = (store: object): readonly string[] =>
@@ -195,8 +248,14 @@ export function createStore<T extends object, D extends object = Record<never, n
 }) {
   type Full = T & D;
 
+  // Captured once per store: `process.env` reads go through an interceptor and
+  // are too slow for repeated checks. Warnings on a store follow the mode it
+  // was created under.
+  const isDev = isDevEnv();
+
   const derivedFns = (config.derived ?? {}) as Record<string, (s: Full) => unknown>;
   const derivedKeys = Object.keys(derivedFns);
+  const hasDerived = derivedKeys.length > 0;
   for (const key of derivedKeys) {
     if (Object.hasOwn(config.state, key)) {
       throw new Error(
@@ -206,41 +265,102 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
   }
   const plugins = config.plugins ?? [];
+  // Per-hook plugin lists, resolved once: the hot paths skip hook dispatch (and
+  // the event-object allocation) entirely when no plugin implements a hook.
+  let afterSetStateHooks: StoicPlugin<T, Full>[] | null = null;
+  let beforeActionHooks: StoicPlugin<T, Full>[] | null = null;
+  let afterActionHooks: StoicPlugin<T, Full>[] | null = null;
+  for (const p of plugins) {
+    if (p.afterSetState) {
+      afterSetStateHooks ??= [];
+      afterSetStateHooks.push(p);
+    }
+    if (p.beforeAction) {
+      beforeActionHooks ??= [];
+      beforeActionHooks.push(p);
+    }
+    if (p.afterAction) {
+      afterActionHooks ??= [];
+      afterActionHooks.push(p);
+    }
+  }
+
   const listeners = new Set<Listener<Full>>();
   // Controllers of in-flight action calls that read `ctx.signal`, so destroy()
-  // can abort them all.
-  const activeControllers = new Set<AbortController>();
-
-  const runHooks = <K extends keyof StoicPlugin<T, Full>>(
-    hook: K,
-    ...args: Parameters<NonNullable<StoicPlugin<T, Full>[K]>>
-  ) => {
-    for (const p of plugins) {
-      (p[hook] as ((...a: typeof args) => void) | undefined)?.(...args);
-    }
-  };
+  // can abort them all. Allocated on the first signal read.
+  let activeControllers: Set<AbortController> | null = null;
 
   const cells: Record<string, Cell> = {};
   for (const key of derivedKeys) {
     cells[key] = {
       value: undefined,
       deps: null,
+      derivedDeps: false,
       computing: false,
     };
   }
   // Path of derived keys currently being computed, for cycle error messages.
   const computeStack: string[] = [];
 
-  // Replaces the snapshot's getter for `key` with the resolved value. On an
-  // existing configurable property, defineProperty leaves omitted attributes
-  // alone, so the pinned property stays enumerable (and non-writable, like the
-  // setter-less getter it replaces).
+  // Pins the resolved value on the snapshot as an own data property, shadowing
+  // the prototype getter. Non-writable (like the getter it shadows), and
+  // enumerable/configurable must be spelled out — this adds a property rather
+  // than reconfiguring one, so nothing carries over.
   const pin = (snap: Full, key: string, value: unknown) => {
-    Object.defineProperty(snap, key, { value });
+    Object.defineProperty(snap, key, { value, enumerable: true, configurable: true });
   };
+
+  // One tracking proxy per store, retargeted around each compute via these
+  // closure slots (computes nest when a derived fn reads another derived key,
+  // so readDerived saves and restores them). Reads resolve directly against
+  // the snapshot — receiver included — so a derived dep's getter memoizes
+  // against the snapshot and its own transitive reads are not recorded as the
+  // outer cell's deps.
+  let trackSnap: Record<string, unknown> = undefined as never;
+  let trackDeps: unknown[] = undefined as never;
+  const tracked = hasDerived
+    ? (new Proxy(
+        {},
+        {
+          get(_target, prop) {
+            const value = trackSnap[prop as string];
+            if (typeof prop === "string") {
+              const deps = trackDeps;
+              // Deduped by linear scan: dep counts are small, and a derived fn
+              // that reads the same key in a loop must not bloat the record.
+              for (let i = 0; i < deps.length; i += 2) {
+                if (deps[i] === prop) return value;
+              }
+              deps.push(prop, value);
+            }
+            return value;
+          },
+          // Untracked structural traps, so `in` checks and spreads inside a
+          // derived fn still see the snapshot instead of the dummy target.
+          has: (_target, prop) => prop in trackSnap,
+          ownKeys: () => Reflect.ownKeys(trackSnap),
+          getOwnPropertyDescriptor(_target, prop) {
+            const desc = Reflect.getOwnPropertyDescriptor(trackSnap, prop);
+            // The dummy target lacks the property, so it must be reported
+            // configurable to satisfy the proxy invariants.
+            if (desc !== undefined) desc.configurable = true;
+            return desc;
+          },
+        },
+      ) as Full)
+    : (undefined as never);
 
   const readDerived = (key: string, snap: Full): unknown => {
     const cell = cells[key] as Cell;
+    const deps = cell.deps;
+    // Fast path: a raw-only dep record cannot recurse, so its freshness check
+    // needs no cycle guard.
+    if (deps !== null && !cell.derivedDeps) {
+      if (isFresh(deps, snap as Record<string, unknown>)) {
+        pin(snap, key, cell.value);
+        return cell.value;
+      }
+    }
     if (cell.computing) {
       throw new CircularDependencyError([...computeStack.slice(computeStack.indexOf(key)), key]);
     }
@@ -250,40 +370,33 @@ export function createStore<T extends object, D extends object = Record<never, n
     cell.computing = true;
     computeStack.push(key);
     try {
-      if (cell.deps !== null) {
-        let fresh = true;
-        for (const [depKey, depValue] of cell.deps) {
-          if (!Object.is(depValue, (snap as Record<string, unknown>)[depKey])) {
-            fresh = false;
-            break;
-          }
-        }
-        if (fresh) {
+      if (deps !== null && cell.derivedDeps) {
+        if (isFresh(deps, snap as Record<string, unknown>)) {
           pin(snap, key, cell.value);
           return cell.value;
         }
       }
 
-      const deps: [string, unknown][] = [];
-      // Deduped: a derived fn that reads the same key in a loop must not bloat
-      // the dep record (every entry is re-read on each freshness check). The
-      // snapshot is immutable, so repeat reads see the same value anyway.
-      const seen = new Set<string>();
-      const tracked = new Proxy(snap as object, {
-        get(target, prop) {
-          // Receiver must be the snapshot (not the proxy) so a derived dep's
-          // getter memoizes against the snapshot and its own transitive reads
-          // are not recorded as this cell's deps.
-          const value = Reflect.get(target, prop, target);
-          if (typeof prop === "string" && !seen.has(prop)) {
-            seen.add(prop);
-            deps.push([prop, value]);
-          }
-          return value;
-        },
-      });
-      cell.value = (derivedFns[key] as (s: Full) => unknown)(tracked as Full);
-      cell.deps = deps;
+      const prevSnap = trackSnap;
+      const prevDeps = trackDeps;
+      trackSnap = snap as Record<string, unknown>;
+      const recorded: unknown[] = [];
+      trackDeps = recorded;
+      try {
+        cell.value = (derivedFns[key] as (s: Full) => unknown)(tracked);
+      } finally {
+        trackSnap = prevSnap;
+        trackDeps = prevDeps;
+      }
+      cell.deps = recorded;
+      let derivedDeps = false;
+      for (let i = 0; i < recorded.length; i += 2) {
+        if (Object.hasOwn(cells, recorded[i] as string)) {
+          derivedDeps = true;
+          break;
+        }
+      }
+      cell.derivedDeps = derivedDeps;
       pin(snap, key, cell.value);
       return cell.value;
     } finally {
@@ -292,22 +405,19 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
   };
 
-  // Shared descriptors: the getter resolves against `this`, so one map serves
-  // every snapshot.
-  const descriptors: PropertyDescriptorMap = {};
-  for (const key of derivedKeys) {
-    descriptors[key] = {
-      enumerable: true,
-      configurable: true,
-      get(this: Full) {
-        return readDerived(key, this);
-      },
-    };
-  }
+  // Derived getters live on one shared prototype (cached per `derived`
+  // config) — snapshots are created with a plain prototype link plus an
+  // own-key copy, never per-snapshot defineProperties. The getter resolves
+  // through the snapshot's own READ_DERIVED slot back into this store.
+  const derivedProto = hasDerived ? protoFor(config.derived as object, derivedKeys) : null;
 
-  const makeSnapshot = (raw: T): Full => {
-    const snap = { ...raw } as Full;
-    if (derivedKeys.length > 0) Object.defineProperties(snap, descriptors);
+  const makeSnapshot = (nextRaw: T): Full => {
+    // Without derived keys the raw object doubles as the snapshot: it is
+    // freshly copied on every accepted write and never mutated afterwards.
+    if (derivedProto === null) return nextRaw as Full;
+    const snap = Object.assign(Object.create(derivedProto), nextRaw) as Full;
+    READ_DESC.value = readDerived as ReadDerived;
+    Object.defineProperty(snap, READ_DERIVED, READ_DESC);
     return snap;
   };
 
@@ -318,7 +428,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   // Dev-only: evaluate every derived key once so a statically cyclic config
   // fails at creation instead of on first read. Production skips the eager
   // pass — derived values stay lazy and a cycle still throws on read.
-  if (isDevEnv()) {
+  if (isDev) {
     for (const key of derivedKeys) readDerived(key, snapshot);
   }
 
@@ -346,7 +456,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     // batch): listeners are already cleared, but plugins must not hear
     // afterSetState after their onDestroy ran.
     if (destroyed) return;
-    if (notifyDepth > 0 && isDevEnv()) {
+    if (notifyDepth > 0 && isDev) {
       console.warn(
         "stoic: re-entrant setState detected — a plugin or subscriber updated state while a " +
           "notification was in progress. Prefer derived state or batching over update loops.",
@@ -359,10 +469,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     notifyDepth++;
     try {
-      runHooks("afterSetState", snapshot, actionName, actionArgs);
-      listeners.forEach((l) => {
-        l(snapshot);
-      });
+      if (afterSetStateHooks !== null) {
+        for (const p of afterSetStateHooks) p.afterSetState?.(snapshot, actionName, actionArgs);
+      }
+      for (const l of listeners) l(snapshot);
     } finally {
       notifyDepth--;
     }
@@ -370,15 +480,16 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const setState: SetState<T, Full> = (partial) => {
     if (destroyed) {
-      if (isDevEnv()) console.warn("stoic: setState called on a destroyed store; ignored");
+      if (isDev) console.warn("stoic: setState called on a destroyed store; ignored");
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
 
     let nextRaw: T | null = null;
-    for (const key of Object.keys(next)) {
-      if (Object.hasOwn(cells, key)) {
-        if (isDevEnv()) {
+    for (const key in next) {
+      if (!Object.hasOwn(next, key)) continue;
+      if (hasDerived && Object.hasOwn(cells, key)) {
+        if (isDev) {
           console.warn(`stoic: setState ignored derived key "${key}"; derived values are computed`);
         }
         continue;
@@ -421,7 +532,7 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const subscribe = (listener: Listener<Full>) => {
     if (destroyed) {
-      if (isDevEnv()) console.warn("stoic: subscribe called on a destroyed store; ignored");
+      if (isDev) console.warn("stoic: subscribe called on a destroyed store; ignored");
       return () => {};
     }
     listeners.add(listener);
@@ -433,7 +544,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     // Meta tracks the most recent invocation: a stale call settling later must
     // not overwrite the outcome of a newer one.
     let latestCall = 0;
-    const metaListeners = new Set<(meta: ActionMeta) => void>();
+    let metaListeners: Set<(meta: ActionMeta) => void> | null = null;
     // Controller of the newest in-flight call that read `ctx.signal`; the next
     // call aborts it. Cleared on settle so a finished call is never aborted.
     let currentController: AbortController | null = null;
@@ -442,47 +553,28 @@ export function createStore<T extends object, D extends object = Record<never, n
       if (callId !== latestCall) return;
       if (meta.status === next.status && meta.error === next.error) return;
       meta = next;
-      metaListeners.forEach((l) => {
-        l(meta);
-      });
+      if (metaListeners !== null) {
+        for (const l of metaListeners) l(meta);
+      }
     };
 
-    const runner = (...args: unknown[]) => {
-      if (currentController !== null) {
-        activeControllers.delete(currentController);
-        const previous = currentController;
-        currentController = null;
-        previous.abort();
-      }
-
-      // Not after destroy: onDestroy already ran, mirroring afterAction below.
-      if (!destroyed) runHooks("beforeAction", { name, args, state: getState() });
-
-      const callId = ++latestCall;
-      setMeta(callId, { status: "pending", error: undefined });
-
+    // One context class per runner: call contexts are monomorphic instances
+    // with the `signal` accessor on the prototype instead of a fresh accessor
+    // object per invocation. `set` and `get` stay per-call/closure functions
+    // because actions destructure them off the context.
+    class CallCtx implements ActionCtx<T, Full> {
+      callId: number;
+      args: unknown[];
       // Lazy: allocated only when the action reads `ctx.signal`.
-      let controller: AbortController | null = null;
-
-      const settle = (outcome: ActionMeta) => {
-        if (controller !== null && currentController === controller) {
-          activeControllers.delete(controller);
-          currentController = null;
-        }
-        // Not after destroy: onDestroy already ran, so plugins must not be
-        // observed again. Meta still settles — handles outlive the store.
-        if (!destroyed) runHooks("afterAction", { name, args, state: getState() });
-        setMeta(callId, outcome);
-      };
-
+      controller: AbortController | null = null;
       // Attribution wraps each write, not the action body: only writes made
       // through this action's `set` are credited to it, and the credit
       // survives `await`s and overlapping actions.
-      const set: SetState<T, Full> = (partial) => {
+      set: SetState<T, Full> = (partial) => {
         const prevName = currentActionName;
         const prevArgs = currentActionArgs;
         currentActionName = name;
-        currentActionArgs = args;
+        currentActionArgs = this.args;
         try {
           setState(partial);
         } finally {
@@ -490,26 +582,66 @@ export function createStore<T extends object, D extends object = Record<never, n
           currentActionArgs = prevArgs;
         }
       };
+      get = getState;
 
-      const ctx: ActionCtx<T, Full> = {
-        set,
-        get: getState,
-        get signal() {
-          if (controller === null) {
-            controller = new AbortController();
-            if (callId === latestCall && !destroyed) {
-              currentController = controller;
-              activeControllers.add(controller);
-            } else {
-              // A newer call has already started (or the store is gone), so
-              // this call is stale by the abort contract: its signal is born
-              // aborted, and it must not take the abort slot from the newest
-              // in-flight call.
-              controller.abort();
-            }
+      constructor(callId: number, args: unknown[]) {
+        this.callId = callId;
+        this.args = args;
+      }
+
+      get signal(): AbortSignal {
+        let controller = this.controller;
+        if (controller === null) {
+          controller = new AbortController();
+          this.controller = controller;
+          if (this.callId === latestCall && !destroyed) {
+            currentController = controller;
+            activeControllers ??= new Set();
+            activeControllers.add(controller);
+          } else {
+            // A newer call has already started (or the store is gone), so
+            // this call is stale by the abort contract: its signal is born
+            // aborted, and it must not take the abort slot from the newest
+            // in-flight call.
+            controller.abort();
           }
-          return controller.signal;
-        },
+        }
+        return controller.signal;
+      }
+    }
+
+    const runner = (...args: unknown[]) => {
+      if (currentController !== null) {
+        activeControllers?.delete(currentController);
+        const previous = currentController;
+        currentController = null;
+        previous.abort();
+      }
+
+      // Not after destroy: onDestroy already ran, mirroring afterAction below.
+      if (beforeActionHooks !== null && !destroyed) {
+        const event: ActionEvent<Full> = { name, args, state: snapshot };
+        for (const p of beforeActionHooks) p.beforeAction?.(event);
+      }
+
+      const callId = ++latestCall;
+      setMeta(callId, { status: "pending", error: undefined });
+
+      const ctx = new CallCtx(callId, args);
+
+      const settle = (outcome: ActionMeta) => {
+        const controller = ctx.controller;
+        if (controller !== null && currentController === controller) {
+          activeControllers?.delete(controller);
+          currentController = null;
+        }
+        // Not after destroy: onDestroy already ran, so plugins must not be
+        // observed again. Meta still settles — handles outlive the store.
+        if (afterActionHooks !== null && !destroyed) {
+          const event: ActionEvent<Full> = { name, args, state: snapshot };
+          for (const p of afterActionHooks) p.afterAction?.(event);
+        }
+        setMeta(callId, outcome);
       };
 
       let result: unknown;
@@ -538,20 +670,23 @@ export function createStore<T extends object, D extends object = Record<never, n
 
     runner.getMeta = () => meta;
     runner.subscribeMeta = (listener: (meta: ActionMeta) => void) => {
-      metaListeners.add(listener);
-      return () => metaListeners.delete(listener);
+      metaListeners ??= new Set();
+      const set = metaListeners;
+      set.add(listener);
+      return () => set.delete(listener);
     };
 
     return runner;
   };
 
-  const registeredActionNames = new Set<string>();
+  // Dev-only bookkeeping: the registry exists purely to power the duplicate-
+  // registration warning, so production never allocates or grows the Set.
+  let registeredActionNames: Set<string> | null = null;
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
     const result: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(map)) {
-      // Dev-only bookkeeping: the registry exists purely to power this warning,
-      // so production never grows the Set.
-      if (isDevEnv()) {
+      if (isDev) {
+        registeredActionNames ??= new Set();
         if (registeredActionNames.has(name)) {
           console.warn(
             `stoic: action "${name}" is already registered on this store. Each actions() call ` +
@@ -569,9 +704,11 @@ export function createStore<T extends object, D extends object = Record<never, n
   const destroy = () => {
     if (destroyed) return;
     destroyed = true;
-    for (const controller of activeControllers) controller.abort();
-    activeControllers.clear();
-    runHooks("onDestroy");
+    if (activeControllers !== null) {
+      for (const controller of activeControllers) controller.abort();
+      activeControllers.clear();
+    }
+    for (const p of plugins) p.onDestroy?.();
     listeners.clear();
   };
 
@@ -583,9 +720,11 @@ export function createStore<T extends object, D extends object = Record<never, n
     batch,
     destroy,
   };
-  Object.defineProperty(store, DERIVED_KEYS, { value: derivedKeys });
+  // Plain assignment: symbol keys stay out of Object.keys/JSON, and the store
+  // object is never spread — defineProperty here would only slow creation.
+  (store as Record<symbol, unknown>)[DERIVED_KEYS] = derivedKeys;
 
-  runHooks("onInit", store);
+  for (const p of plugins) p.onInit?.(store);
 
   return store;
 }
