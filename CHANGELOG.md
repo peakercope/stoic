@@ -1,5 +1,11 @@
 # stoic
 
+## 0.11.1
+
+### Patch Changes
+
+- 436eb1b: Stale ctx.signal fix, plugin hooks fire after onDestroy, docs updated
+
 ## 0.11.0
 
 ### Minor Changes
