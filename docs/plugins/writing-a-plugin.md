@@ -46,7 +46,7 @@ Called when `store.destroy()` is called.
 
 ## Rules
 
-> Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as [derived state](../derived-state.md) instead.
+> Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as [derived state](../derived-state.md) instead. Note also what a re-entrant write does to ordering: the nested update notifies everyone immediately, and the interrupted notification then resumes with the *newest* snapshot — so later listeners can receive the same state twice and never observe the intermediate one.
 
 > A subscriber or hook that throws stops later subscribers from being notified for that update, and the error propagates to whoever called `setState` (or the action's `set`). Keep subscribers exception-safe.
 

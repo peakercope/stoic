@@ -48,7 +48,7 @@ Async actions resolve with their return value the same way.
 
 Every action receives a context as its first argument, followed by whatever arguments you call it with. The context has three members:
 
-- `set` — updates state. Accepts either a partial state object or an updater function that reads the current state.
+- `set` — updates state. Accepts either a partial state object or an updater function that reads the current state. Return only the keys that change: spreading the whole state (`set((s) => ({ ...s, x }))`) computes every derived value just to build the partial, and the derived keys it copies along are ignored with a dev warning.
 - `get` — returns the current state (including derived values), useful for reading mid-action.
 - `signal` — an `AbortSignal` that is aborted when a newer call of the same action starts, or when the store is destroyed. See [Overlapping calls and cancellation](#overlapping-calls-and-cancellation).
 

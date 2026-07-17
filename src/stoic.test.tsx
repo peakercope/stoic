@@ -1036,6 +1036,35 @@ describe("plugins", () => {
     expect(afterAction).not.toHaveBeenCalled();
   });
 
+  it("does not call beforeAction for an action invoked after destroy()", () => {
+    const beforeAction = vi.fn();
+    const plugin: StoicPlugin<{ count: number }> = { beforeAction };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const { noop } = store.actions({ noop: () => {} });
+
+    store.destroy();
+    noop();
+
+    expect(beforeAction).not.toHaveBeenCalled();
+    // Meta still settles — handles outlive the store, like afterAction's contract.
+    expect(noop.getMeta().status).toBe("success");
+  });
+
+  it("does not call afterSetState when destroy() runs inside the batch that changed state", () => {
+    const afterSetState = vi.fn();
+    const onDestroy = vi.fn();
+    const plugin: StoicPlugin<{ count: number }> = { afterSetState, onDestroy };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+
+    store.batch(() => {
+      store.setState({ count: 1 });
+      store.destroy();
+    });
+
+    expect(onDestroy).toHaveBeenCalledOnce();
+    expect(afterSetState).not.toHaveBeenCalled();
+  });
+
   it("calls onDestroy and stops notifying listeners after destroy()", () => {
     const onDestroy = vi.fn();
     const plugin: StoicPlugin<{ count: number }> = { onDestroy };
@@ -2009,6 +2038,57 @@ describe("action abort signal", () => {
 
     resolve();
     await pending;
+  });
+
+  it("hands an already-aborted signal to a call that first reads it after a newer call started", async () => {
+    const { actions } = createStore({ state: { value: "" } });
+    const signals: AbortSignal[] = [];
+    const gates: (() => void)[] = [];
+    const hang = () =>
+      new Promise<void>((resolve) => {
+        gates.push(resolve);
+      });
+    const { load } = actions({
+      load: async (ctx, readEarly: boolean) => {
+        if (!readEarly) await hang();
+        signals.push(ctx.signal);
+        await hang();
+      },
+    });
+
+    const first = load(false); // defers its signal read past the next call
+    const second = load(true); // signals[0]
+    gates[0]?.(); // let the first call resume and read its signal → signals[1]
+    await Promise.resolve();
+
+    // The first call is stale (a newer call already started), so its signal is
+    // born aborted — and it must not hijack the abort slot from the second call.
+    expect(signals[1]?.aborted).toBe(true);
+
+    const third = load(true); // signals[2]
+
+    // The third call supersedes the second — the newest in-flight call, not
+    // the already-stale first one.
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[2]?.aborted).toBe(false);
+
+    for (const release of gates) release();
+    await Promise.all([first, second, third]);
+  });
+
+  it("hands an already-aborted signal to an action called after destroy()", () => {
+    const store = createStore({ state: { value: "" } });
+    let signal!: AbortSignal;
+    const { load } = store.actions({
+      load: (ctx) => {
+        signal = ctx.signal;
+      },
+    });
+
+    store.destroy();
+    load();
+
+    expect(signal.aborted).toBe(true);
   });
 
   it("aborts independently per action", async () => {

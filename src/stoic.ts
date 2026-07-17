@@ -342,6 +342,10 @@ export function createStore<T extends object, D extends object = Record<never, n
   let notifyDepth = 0;
 
   const notify = (actionName?: string, actionArgs?: readonly unknown[]) => {
+    // Reachable on a destroyed store via a batch flush (destroy() inside the
+    // batch): listeners are already cleared, but plugins must not hear
+    // afterSetState after their onDestroy ran.
+    if (destroyed) return;
     if (notifyDepth > 0 && isDevEnv()) {
       console.warn(
         "stoic: re-entrant setState detected — a plugin or subscriber updated state while a " +
@@ -451,7 +455,8 @@ export function createStore<T extends object, D extends object = Record<never, n
         previous.abort();
       }
 
-      runHooks("beforeAction", { name, args, state: getState() });
+      // Not after destroy: onDestroy already ran, mirroring afterAction below.
+      if (!destroyed) runHooks("beforeAction", { name, args, state: getState() });
 
       const callId = ++latestCall;
       setMeta(callId, { status: "pending", error: undefined });
@@ -492,8 +497,16 @@ export function createStore<T extends object, D extends object = Record<never, n
         get signal() {
           if (controller === null) {
             controller = new AbortController();
-            currentController = controller;
-            activeControllers.add(controller);
+            if (callId === latestCall && !destroyed) {
+              currentController = controller;
+              activeControllers.add(controller);
+            } else {
+              // A newer call has already started (or the store is gone), so
+              // this call is stale by the abort contract: its signal is born
+              // aborted, and it must not take the abort slot from the newest
+              // in-flight call.
+              controller.abort();
+            }
           }
           return controller.signal;
         },

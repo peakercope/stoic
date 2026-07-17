@@ -419,7 +419,7 @@ describe("persist", () => {
   });
 
   describe("failing writes", () => {
-    it("warns on each failed write but stays active for later ones", () => {
+    it("warns once across failed writes but stays active for later ones", () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       let failWrites = true;
       const written: string[] = [];
@@ -438,7 +438,9 @@ describe("persist", () => {
 
       store.setState({ n: 1 });
       store.setState({ n: 2 });
-      expect(warnSpy).toHaveBeenCalledTimes(2);
+      // Once per store, not per write: a persistently failing backend must not
+      // flood the console.
+      expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("write"));
 
       // Once the backend recovers (e.g. space was freed), writes resume.

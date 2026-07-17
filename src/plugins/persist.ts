@@ -206,6 +206,15 @@ export function persist<T extends object>(options: {
     return JSON.stringify({ version: options.version, state: filtered });
   };
 
+  // Once per store, not per write, or a persistently failing backend (full
+  // quota) floods the console — but not dev-gated, because it signals data loss.
+  let warnedWriteFailure = false;
+  const warnWriteFailure = () => {
+    if (warnedWriteFailure) return;
+    warnedWriteFailure = true;
+    console.warn("Stoic persist plugin: failed to write state to storage");
+  };
+
   // An async driver can have a write in flight when the next one arrives.
   // Writes are coalesced rather than queued: only the newest state matters, so
   // storage converges on the last commit without an unbounded backlog.
@@ -223,7 +232,7 @@ export function persist<T extends object>(options: {
     try {
       payload = encode(state);
     } catch {
-      console.warn("Stoic persist plugin: failed to write state to storage");
+      warnWriteFailure();
       return;
     }
 
@@ -239,7 +248,7 @@ export function persist<T extends object>(options: {
       () => driver.setItem(options.key, payload),
       done,
       () => {
-        console.warn("Stoic persist plugin: failed to write state to storage");
+        warnWriteFailure();
         done();
       },
     );

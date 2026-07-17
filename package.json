@@ -60,7 +60,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.7",
-    "@changesets/cli": "^2.31.0",
+    "@changesets/cli": "^2.31.1",
     "@redux-devtools/extension": "^4.0.0",
     "@tsconfig/strictest": "^2.0.8",
     "@types/node": "24.13.3",
@@ -72,9 +72,9 @@
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "redux": "5.0.1",
-    "tsdown": "^0.22.7",
+    "tsdown": "^0.22.9",
     "typescript": "^6.0.3",
-    "vite": "8.1.4",
+    "vite": "8.1.5",
     "vitest": "4.1.10"
   },
   "packageManager": "yarn@4.17.1"
