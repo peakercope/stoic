@@ -251,6 +251,11 @@ export function createStore<T extends object, D extends object = Record<never, n
   const derivedFns = (config.derived ?? {}) as Record<string, (s: Full) => unknown>;
   const derivedKeys = Object.keys(derivedFns);
   const hasDerived = derivedKeys.length > 0;
+  // The state shape is fixed at creation: setState only applies these keys.
+  // `initialState` doubles as the membership check (hasOwn beats a Set here —
+  // no extra allocation at creation, same lookup cost per written key).
+  const initialState = config.state as Record<string, unknown>;
+  const rawKeys = Object.keys(config.state);
   for (const key of derivedKeys) {
     if (Object.hasOwn(config.state, key)) {
       throw new Error(
@@ -411,15 +416,15 @@ export function createStore<T extends object, D extends object = Record<never, n
     (derivedProto as WithRead)[READ_DERIVED] = readDerived as ReadDerived;
   }
 
-  const makeSnapshot = (nextRaw: T): Full => {
-    // Without derived keys the raw object doubles as the snapshot: it is
-    // freshly copied on every accepted write and never mutated afterwards.
-    if (derivedProto === null) return nextRaw as Full;
-    return Object.assign(Object.create(derivedProto), nextRaw) as Full;
-  };
-
-  let raw = { ...config.state };
-  let snapshot = makeSnapshot(raw);
+  // The snapshot is the single source of truth — there is no separate raw
+  // copy. Each accepted write builds the next snapshot in one pass; only
+  // `rawKeys` are carried over, so pinned derived own-properties never leak
+  // into the next snapshot.
+  let snapshot = (
+    derivedProto === null
+      ? { ...config.state }
+      : Object.assign(Object.create(derivedProto), config.state)
+  ) as Full;
   let destroyed = false;
 
   // Dev-only: evaluate every derived key once so a statically cyclic config
@@ -482,25 +487,46 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
 
-    let nextRaw: T | null = null;
+    const snap = snapshot as Record<string, unknown>;
+    let nextSnap: Record<string, unknown> | null = null;
+    // No own-key guard on the partial: the membership check against
+    // `initialState` below already rejects anything that isn't a state key,
+    // so inherited enumerable keys can't smuggle values in — they are either
+    // state keys (applied, as an own read would be) or ignored.
     for (const key in next) {
-      if (!Object.hasOwn(next, key)) continue;
-      if (hasDerived && Object.hasOwn(cells, key)) {
+      if (!Object.hasOwn(initialState, key)) {
+        // Derived keys were never writable; unknown keys are rejected because
+        // the state shape is fixed at creation (keeps every snapshot on one
+        // hidden class and the derived dep records exhaustive).
         if (isDev) {
-          console.warn(`stoic: setState ignored derived key "${key}"; derived values are computed`);
+          console.warn(
+            hasDerived && Object.hasOwn(cells, key)
+              ? `stoic: setState ignored derived key "${key}"; derived values are computed`
+              : `stoic: setState ignored unknown key "${key}"; the state shape is fixed by \`state\` at creation`,
+          );
         }
         continue;
       }
       const value = (next as Record<string, unknown>)[key];
-      if (!Object.is((raw as Record<string, unknown>)[key], value)) {
-        if (nextRaw === null) nextRaw = { ...raw };
-        (nextRaw as Record<string, unknown>)[key] = value;
+      if (!Object.is(snap[key], value)) {
+        if (nextSnap === null) {
+          if (derivedProto === null) {
+            nextSnap = { ...snap };
+          } else {
+            // Copy only rawKeys (never pins), reading from the old snapshot.
+            nextSnap = Object.create(derivedProto) as Record<string, unknown>;
+            for (let i = 0; i < rawKeys.length; i++) {
+              const k = rawKeys[i] as string;
+              nextSnap[k] = snap[k];
+            }
+          }
+        }
+        nextSnap[key] = value;
       }
     }
-    if (nextRaw === null) return;
+    if (nextSnap === null) return;
 
-    raw = nextRaw;
-    snapshot = makeSnapshot(raw);
+    snapshot = nextSnap as Full;
 
     if (batchDepth > 0) {
       batchChanged = true;
