@@ -177,23 +177,18 @@ const isFresh = (deps: unknown[], snap: Record<string, unknown>): boolean => {
 // on a shared prototype and self-memoize into plain data properties on read.
 const DERIVED_KEYS = Symbol("stoic.derivedKeys");
 
-// Every snapshot carries its store's readDerived under this symbol, so the
-// prototype getters need nothing store-specific and one prototype serves every
-// store built from the same `derived` config. That sharing is what makes the
-// cache below worth having: V8 keys hidden classes by prototype, so a fresh
-// prototype per store would force a fresh shape tree for its snapshots —
-// roughly a microsecond per store — while factory-created stores (contexts,
-// tests, one store per request) reuse the cached prototype's tree for free.
+// Each store's readDerived lives as a plain data property on a per-store
+// intermediate prototype under this symbol, one hop below the shared getter
+// prototype: snap → store proto (readDerived slot) → shared getter proto.
+// The getters need nothing store-specific, so one getter prototype (cached
+// per `derived` config) serves every store built from that config, and
+// neither snapshots nor writes ever carry a per-snapshot slot — the old
+// design's non-enumerable defineProperty per snapshot took a slow attribute-
+// transition path on every accepted write.
 const READ_DERIVED = Symbol("stoic.readDerived");
 
 type ReadDerived = (key: string, snap: object) => unknown;
 type WithRead = { [READ_DERIVED]: ReadDerived };
-
-// Reused (synchronously, in full) for every snapshot: the slot must be
-// non-enumerable so it stays out of spreads, Object.assign, and deep-equality
-// — which rules out plain assignment — and reusing one descriptor object keeps
-// the per-snapshot cost to the defineProperty call itself.
-const READ_DESC: { value: ReadDerived | undefined } = { value: undefined };
 
 const PROTO_CACHE = new WeakMap<object, object>();
 
@@ -405,20 +400,22 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
   };
 
-  // Derived getters live on one shared prototype (cached per `derived`
-  // config) — snapshots are created with a plain prototype link plus an
-  // own-key copy, never per-snapshot defineProperties. The getter resolves
-  // through the snapshot's own READ_DERIVED slot back into this store.
-  const derivedProto = hasDerived ? protoFor(config.derived as object, derivedKeys) : null;
+  // Per-store intermediate prototype: carries this store's readDerived under
+  // the module symbol, one hop below the shared getter prototype. Costs a
+  // fresh snapshot shape tree per store (~1µs at creation), which buys every
+  // write out of the old per-snapshot defineProperty — a trade that pays for
+  // itself within ~a dozen writes.
+  let derivedProto: object | null = null;
+  if (hasDerived) {
+    derivedProto = Object.create(protoFor(config.derived as object, derivedKeys));
+    (derivedProto as WithRead)[READ_DERIVED] = readDerived as ReadDerived;
+  }
 
   const makeSnapshot = (nextRaw: T): Full => {
     // Without derived keys the raw object doubles as the snapshot: it is
     // freshly copied on every accepted write and never mutated afterwards.
     if (derivedProto === null) return nextRaw as Full;
-    const snap = Object.assign(Object.create(derivedProto), nextRaw) as Full;
-    READ_DESC.value = readDerived as ReadDerived;
-    Object.defineProperty(snap, READ_DERIVED, READ_DESC);
-    return snap;
+    return Object.assign(Object.create(derivedProto), nextRaw) as Full;
   };
 
   let raw = { ...config.state };
