@@ -18,10 +18,24 @@
 // literal token visible to the type checker without pulling in @types/node.
 declare const process: { env: { NODE_ENV?: string } };
 
+// Memoized: the `process.env` read goes through Node's env interceptor and
+// costs ~130ns — a dominant share of store creation. The mode is resolved on
+// first use and fixed for the module's lifetime (bundled builds inline it to
+// a constant anyway).
+let cached: boolean | undefined;
+
 export const isDevEnv = (): boolean => {
-  try {
-    return process.env.NODE_ENV !== "production";
-  } catch {
-    return true;
+  if (cached === undefined) {
+    try {
+      cached = process.env.NODE_ENV !== "production";
+    } catch {
+      cached = true;
+    }
   }
+  return cached;
+};
+
+/** @internal Test-only: clears the memoized mode so env stubs are re-read. */
+export const resetDevEnvCacheForTests = (): void => {
+  cached = undefined;
 };

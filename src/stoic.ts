@@ -261,9 +261,6 @@ export function createStore<T extends object, D extends object = Record<never, n
 }) {
   type Full = T & D;
 
-  // Captured once per store: `process.env` reads go through an interceptor and
-  // are too slow for repeated checks. Warnings on a store follow the mode it
-  // was created under.
   const isDev = isDevEnv();
 
   const derivedFns = (config.derived ?? {}) as Record<string, (s: Full) => unknown>;
@@ -308,7 +305,9 @@ export function createStore<T extends object, D extends object = Record<never, n
   // can abort them all. Allocated on the first signal read.
   let activeControllers: Set<AbortController> | null = null;
 
-  const cells: Record<string, Cell> = {};
+  // Derived-only structures are never allocated for state-only stores; every
+  // use is behind a hasDerived (or derived-read) path.
+  const cells: Record<string, Cell> = hasDerived ? {} : (null as never);
   for (const key of derivedKeys) {
     cells[key] = {
       value: undefined,
@@ -318,7 +317,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     };
   }
   // Path of derived keys currently being computed, for cycle error messages.
-  const computeStack: string[] = [];
+  const computeStack: string[] = hasDerived ? [] : (null as never);
 
   // One tracker object per store, retargeted around each compute via these
   // closure slots (computes nest when a derived fn reads another derived key,
@@ -741,6 +740,9 @@ export function createStore<T extends object, D extends object = Record<never, n
     listeners.clear();
   };
 
+  // The symbol sits in the literal so the store object gets its final shape
+  // in one step instead of a post-literal transition; symbol keys stay out of
+  // Object.keys/JSON either way.
   const store: StoicStore<T, Full> = {
     getState,
     setState,
@@ -748,10 +750,8 @@ export function createStore<T extends object, D extends object = Record<never, n
     actions,
     batch,
     destroy,
-  };
-  // Plain assignment: symbol keys stay out of Object.keys/JSON, and the store
-  // object is never spread — defineProperty here would only slow creation.
-  (store as Record<symbol, unknown>)[DERIVED_KEYS] = derivedKeys;
+    [DERIVED_KEYS]: derivedKeys,
+  } as StoicStore<T, Full>;
 
   for (const p of plugins) p.onInit?.(store);
 
