@@ -218,6 +218,13 @@ const protoFor = (derivedConfig: object, derivedKeys: string[]): object => {
 // reused across pins and cleared after, so a pin allocates nothing and
 // retains nothing (measured: writable/all-true attributes bought nothing —
 // pin cost is dwarfed by the recompute around it).
+// Shared, frozen meta singletons: every non-error outcome is one of these,
+// so a sync action call allocates no meta objects at all. Error metas carry
+// a per-call `error` and stay allocated.
+const IDLE_META: ActionMeta = Object.freeze({ status: "idle", error: undefined });
+const PENDING_META: ActionMeta = Object.freeze({ status: "pending", error: undefined });
+const SUCCESS_META: ActionMeta = Object.freeze({ status: "success", error: undefined });
+
 const PIN_DESC: PropertyDescriptor = {
   value: undefined,
   enumerable: true,
@@ -568,7 +575,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   };
 
   const createActionRunner = (name: string, fn: (...args: unknown[]) => unknown) => {
-    let meta: ActionMeta = { status: "idle", error: undefined };
+    let meta: ActionMeta = IDLE_META;
     // Meta tracks the most recent invocation: a stale call settling later must
     // not overwrite the outcome of a newer one.
     let latestCall = 0;
@@ -636,6 +643,23 @@ export function createStore<T extends object, D extends object = Record<never, n
         }
         return controller.signal;
       }
+
+      // A prototype method, not a per-call closure: everything per-call it
+      // needs lives on `this`, the rest comes from the runner's scope.
+      settle(outcome: ActionMeta) {
+        const controller = this.controller;
+        if (controller !== null && currentController === controller) {
+          activeControllers?.delete(controller);
+          currentController = null;
+        }
+        // Not after destroy: onDestroy already ran, so plugins must not be
+        // observed again. Meta still settles — handles outlive the store.
+        if (afterActionHooks !== null && !destroyed) {
+          const event: ActionEvent<Full> = { name, args: this.args, state: snapshot };
+          for (const p of afterActionHooks) p.afterAction?.(event);
+        }
+        setMeta(this.callId, outcome);
+      }
     }
 
     const runner = (...args: unknown[]) => {
@@ -653,46 +677,31 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
 
       const callId = ++latestCall;
-      setMeta(callId, { status: "pending", error: undefined });
+      setMeta(callId, PENDING_META);
 
       const ctx = new CallCtx(callId, args);
-
-      const settle = (outcome: ActionMeta) => {
-        const controller = ctx.controller;
-        if (controller !== null && currentController === controller) {
-          activeControllers?.delete(controller);
-          currentController = null;
-        }
-        // Not after destroy: onDestroy already ran, so plugins must not be
-        // observed again. Meta still settles — handles outlive the store.
-        if (afterActionHooks !== null && !destroyed) {
-          const event: ActionEvent<Full> = { name, args, state: snapshot };
-          for (const p of afterActionHooks) p.afterAction?.(event);
-        }
-        setMeta(callId, outcome);
-      };
 
       let result: unknown;
       try {
         result = fn(ctx, ...args);
       } catch (err) {
-        settle({ status: "error", error: err });
+        ctx.settle({ status: "error", error: err });
         throw err;
       }
 
       if (result instanceof Promise) {
         return result.then(
           (value) => {
-            settle({ status: "success", error: undefined });
+            ctx.settle(SUCCESS_META);
             return value;
           },
           (err) => {
-            settle({ status: "error", error: err });
+            ctx.settle({ status: "error", error: err });
             throw err;
           },
         );
       }
-      settle({ status: "success", error: undefined });
+      ctx.settle(SUCCESS_META);
       return result;
     };
 
