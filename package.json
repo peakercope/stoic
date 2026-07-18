@@ -42,6 +42,8 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "test": "vitest",
+    "bench": "yarn build && vitest bench --run",
+    "bench:prod": "yarn build && NODE_ENV=production vitest bench --run",
     "typecheck": "tsc --noEmit",
     "format": "biome check --write",
     "lint": "biome ci",
