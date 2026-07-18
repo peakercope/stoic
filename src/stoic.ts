@@ -211,6 +211,24 @@ const protoFor = (derivedConfig: object, derivedKeys: string[]): object => {
   return proto;
 };
 
+// Pins a resolved derived value on the snapshot as an own data property,
+// shadowing the prototype getter. Non-writable (like the getter it shadows);
+// enumerable/configurable must be spelled out — this adds a property rather
+// than reconfiguring one, so nothing carries over. The descriptor object is
+// reused across pins and cleared after, so a pin allocates nothing and
+// retains nothing (measured: writable/all-true attributes bought nothing —
+// pin cost is dwarfed by the recompute around it).
+const PIN_DESC: PropertyDescriptor = {
+  value: undefined,
+  enumerable: true,
+  configurable: true,
+};
+const pin = (snap: object, key: string, value: unknown) => {
+  PIN_DESC.value = value;
+  Object.defineProperty(snap, key, PIN_DESC);
+  PIN_DESC.value = undefined;
+};
+
 /** @internal Not part of the public API. */
 export const derivedKeysOf = (store: object): readonly string[] =>
   (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS] ?? [];
@@ -302,13 +320,6 @@ export function createStore<T extends object, D extends object = Record<never, n
   // Path of derived keys currently being computed, for cycle error messages.
   const computeStack: string[] = [];
 
-  // Pins the resolved value on the snapshot as an own data property, shadowing
-  // the prototype getter. Non-writable (like the getter it shadows), and
-  // enumerable/configurable must be spelled out — this adds a property rather
-  // than reconfiguring one, so nothing carries over.
-  const pin = (snap: Full, key: string, value: unknown) => {
-    Object.defineProperty(snap, key, { value, enumerable: true, configurable: true });
-  };
 
   // One tracking proxy per store, retargeted around each compute via these
   // closure slots (computes nest when a derived fn reads another derived key,
