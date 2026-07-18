@@ -257,13 +257,14 @@ describe("derived", () => {
     });
 
     // A fresh snapshot (past the dev-only eager pass at creation) exposes the
-    // derived key as an enumerable getter on its prototype; inspecting it
-    // computes nothing and the snapshot has no own property yet.
+    // derived key as an enumerable getter on its prototype chain (per-store
+    // proto → shared getter proto); inspecting it computes nothing and the
+    // snapshot has no own property yet.
     setState({ count: 4 });
     const snapshot = getState();
     doubled.mockClear();
     expect(Object.getOwnPropertyDescriptor(snapshot, "doubled")).toBeUndefined();
-    const proto = Object.getPrototypeOf(snapshot) as object;
+    const proto = Object.getPrototypeOf(Object.getPrototypeOf(snapshot) as object) as object;
     const before = Object.getOwnPropertyDescriptor(proto, "doubled");
     expect(before?.get).toBeTypeOf("function");
     expect(before?.enumerable).toBe(true);
