@@ -1,4 +1,5 @@
 import { bench, describe } from "vitest";
+//@ts-expect-error
 import { createStore } from "../dist/index.js";
 
 type State = { count: number; name: string; other: number };
@@ -106,13 +107,15 @@ describe("read", () => {
 
 describe("actions", () => {
   const store = createStore({ state: { count: 0, name: "a", other: 1 } });
-  const { inc } = store.actions({ inc: ({ set, get }) => set({ count: get().count + 1 }) });
+  //@ts-expect-error
+  const { inc } = store.actions({ inc: (ctx) => ctx.set({ count: ctx.get().count + 1 }) });
   bench("sync action invocation", () => {
     inc();
   });
 
   const { incAsync } = store.actions({
-    incAsync: async ({ set, get }) => set({ count: get().count + 1 }),
+    //@ts-expect-error
+    incAsync: async (ctx) => ctx.set({ count: ctx.get().count + 1 }),
   });
   bench("async action invocation", async () => {
     await incAsync();
