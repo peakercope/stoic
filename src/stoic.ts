@@ -320,46 +320,40 @@ export function createStore<T extends object, D extends object = Record<never, n
   // Path of derived keys currently being computed, for cycle error messages.
   const computeStack: string[] = [];
 
-
-  // One tracking proxy per store, retargeted around each compute via these
+  // One tracker object per store, retargeted around each compute via these
   // closure slots (computes nest when a derived fn reads another derived key,
-  // so readDerived saves and restores them). Reads resolve directly against
-  // the snapshot — receiver included — so a derived dep's getter memoizes
+  // so readDerived saves and restores them). The state shape is fixed at
+  // creation, so every readable key is known up front and the tracker is a
+  // plain object with one recording accessor per key — a monomorphic getter
+  // call instead of a Proxy get trap on every read inside a derived fn.
+  // Reads resolve against the snapshot, so a derived dep's getter memoizes
   // against the snapshot and its own transitive reads are not recorded as the
-  // outer cell's deps.
+  // outer cell's deps. Built lazily on the first recompute; the dev-only
+  // eager pass at creation triggers it there.
   let trackSnap: Record<string, unknown> = undefined as never;
   let trackDeps: unknown[] = undefined as never;
-  const tracked = hasDerived
-    ? (new Proxy(
-        {},
-        {
-          get(_target, prop) {
-            const value = trackSnap[prop as string];
-            if (typeof prop === "string") {
-              const deps = trackDeps;
-              // Deduped by linear scan: dep counts are small, and a derived fn
-              // that reads the same key in a loop must not bloat the record.
-              for (let i = 0; i < deps.length; i += 2) {
-                if (deps[i] === prop) return value;
-              }
-              deps.push(prop, value);
-            }
-            return value;
-          },
-          // Untracked structural traps, so `in` checks and spreads inside a
-          // derived fn still see the snapshot instead of the dummy target.
-          has: (_target, prop) => prop in trackSnap,
-          ownKeys: () => Reflect.ownKeys(trackSnap),
-          getOwnPropertyDescriptor(_target, prop) {
-            const desc = Reflect.getOwnPropertyDescriptor(trackSnap, prop);
-            // The dummy target lacks the property, so it must be reported
-            // configurable to satisfy the proxy invariants.
-            if (desc !== undefined) desc.configurable = true;
-            return desc;
-          },
-        },
-      ) as Full)
-    : (undefined as never);
+  let tracker: Full | null = null;
+  const makeTracker = (): Full => {
+    const descriptors: PropertyDescriptorMap = {};
+    const recording = (key: string): PropertyDescriptor => ({
+      enumerable: true,
+      configurable: true,
+      get() {
+        const value = trackSnap[key];
+        const deps = trackDeps;
+        // Deduped by linear scan: dep counts are small, and a derived fn
+        // that reads the same key in a loop must not bloat the record.
+        for (let i = 0; i < deps.length; i += 2) {
+          if (deps[i] === key) return value;
+        }
+        deps.push(key, value);
+        return value;
+      },
+    });
+    for (const key of rawKeys) descriptors[key] = recording(key);
+    for (const key of derivedKeys) descriptors[key] = recording(key);
+    return Object.defineProperties({}, descriptors) as Full;
+  };
 
   const readDerived = (key: string, snap: Full): unknown => {
     const cell = cells[key] as Cell;
@@ -393,8 +387,9 @@ export function createStore<T extends object, D extends object = Record<never, n
       trackSnap = snap as Record<string, unknown>;
       const recorded: unknown[] = [];
       trackDeps = recorded;
+      if (tracker === null) tracker = makeTracker();
       try {
-        cell.value = (derivedFns[key] as (s: Full) => unknown)(tracked);
+        cell.value = (derivedFns[key] as (s: Full) => unknown)(tracker);
       } finally {
         trackSnap = prevSnap;
         trackDeps = prevDeps;
