@@ -699,6 +699,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     };
   };
 
+  // Action attribution exists to tell afterSetState which action produced a
+  // write. With no such hook the whole mechanism is unobservable.
+  const attributed = afterSetStateHooks !== null;
+
   const createActionRunner = (name: string, fn: (...args: unknown[]) => unknown) => {
     let meta: ActionMeta = IDLE_META;
     // Meta tracks the most recent invocation: a stale call settling later must
@@ -720,33 +724,39 @@ export function createStore<T extends object, D extends object = Record<never, n
 
     // One context class per runner: call contexts are monomorphic instances
     // with the `signal` accessor on the prototype instead of a fresh accessor
-    // object per invocation. `set` and `get` stay per-call/closure functions
-    // because actions destructure them off the context.
+    // object per invocation. `set` and `get` are prototype properties rather
+    // than class fields — actions destructure them off the context, so they
+    // must not need a receiver, but neither varies per call.
     class CallCtx implements ActionCtx<T, Full> {
+      declare set: SetState<T, Full>;
+      declare get: () => Full;
       callId: number;
       args: unknown[];
       // Lazy: allocated only when the action reads `ctx.signal`.
       controller: AbortController | null = null;
-      // Attribution wraps each write, not the action body: only writes made
-      // through this action's `set` are credited to it, and the credit
-      // survives `await`s and overlapping actions.
-      set: SetState<T, Full> = (partial) => {
-        const prevName = currentActionName;
-        const prevArgs = currentActionArgs;
-        currentActionName = name;
-        currentActionArgs = this.args;
-        try {
-          setState(partial);
-        } finally {
-          currentActionName = prevName;
-          currentActionArgs = prevArgs;
-        }
-      };
-      get = getState;
 
       constructor(callId: number, args: unknown[]) {
         this.callId = callId;
         this.args = args;
+        // Attribution wraps each write, not the action body: only writes made
+        // through this action's `set` are credited to it, and the credit
+        // survives `await`s and overlapping actions. It costs a closure per
+        // call, so it is only installed when something can actually observe it
+        // — `currentActionName`/`Args` are read solely by afterSetState hooks.
+        if (attributed) {
+          this.set = (partial) => {
+            const prevName = currentActionName;
+            const prevArgs = currentActionArgs;
+            currentActionName = name;
+            currentActionArgs = args;
+            try {
+              setState(partial);
+            } finally {
+              currentActionName = prevName;
+              currentActionArgs = prevArgs;
+            }
+          };
+        }
       }
 
       get signal(): AbortSignal {
@@ -787,6 +797,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
     }
 
+    CallCtx.prototype.get = getState;
+    // Without an afterSetState hook nothing reads the attribution, so writes go
+    // straight through and no per-call closure is built at all.
+    if (!attributed) CallCtx.prototype.set = setState;
+
     const runner = (...args: unknown[]) => {
       if (currentController !== null) {
         activeControllers?.delete(currentController);
@@ -802,13 +817,28 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
 
       const callId = ++latestCall;
+      // Announced before the action body runs, not after: an async action that
+      // writes state before its first `await` notifies subscribers from inside
+      // that body, and they must already see `pending` there — that write is
+      // usually exactly what puts a spinner on screen. Skipping it for calls
+      // that turn out to be synchronous measured ~2ns on action:sync, which is
+      // not worth making the async case wrong.
       setMeta(callId, PENDING_META);
-
       const ctx = new CallCtx(callId, args);
 
       let result: unknown;
       try {
-        result = fn(ctx, ...args);
+        // Spelling out the low arities keeps these calls off the spread path,
+        // which builds an argument list at run time. Actions take 0–2 arguments
+        // almost always; anything longer falls back.
+        result =
+          args.length === 0
+            ? fn(ctx)
+            : args.length === 1
+              ? fn(ctx, args[0])
+              : args.length === 2
+                ? fn(ctx, args[0], args[1])
+                : fn(ctx, ...args);
       } catch (err) {
         ctx.settle({ status: "error", error: err });
         throw err;

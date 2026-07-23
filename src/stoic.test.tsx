@@ -909,6 +909,27 @@ describe("action", () => {
     expect(seen).toEqual(["pending", "success"]);
   });
 
+  it("is already pending when an async action writes state before its first await", async () => {
+    const store = createStore({ state: { items: [] as string[] } });
+    const { load } = store.actions({
+      load: async (ctx) => {
+        // The synchronous prefix of an async action — where a spinner is
+        // normally switched on. Subscribers notified by this write have to see
+        // `pending` already, not the previous call's status.
+        ctx.set({ items: [] });
+        await Promise.resolve();
+        ctx.set({ items: ["a"] });
+      },
+    });
+
+    const statusesAtWrite: string[] = [];
+    store.subscribe(() => statusesAtWrite.push(load.getMeta().status));
+
+    await load();
+
+    expect(statusesAtWrite[0]).toBe("pending");
+  });
+
   it("async action that rejects sets error status and still rejects the returned promise", async () => {
     const { actions } = createStore({ state: { value: "" } });
     const failure = new Error("network down");
