@@ -157,12 +157,15 @@ describe("derived", () => {
       state: { price: 10, count: 2, tax: 0.1 },
       derived: { subtotal },
     });
+    // Derived values are lazy, so nothing has run until the first read.
+    expect(subtotal).not.toHaveBeenCalled();
+    expect(getState().subtotal).toBe(20);
     expect(subtotal).toHaveBeenCalledTimes(1);
 
     setState({ tax: 0.2 });
 
-    expect(subtotal).toHaveBeenCalledTimes(1);
     expect(getState().subtotal).toBe(20);
+    expect(subtotal).toHaveBeenCalledTimes(1);
   });
 
   it("cascades recomputation transitively through a chain of derived values", () => {
@@ -213,6 +216,9 @@ describe("derived", () => {
       },
     });
     subscribe(vi.fn());
+    // Warm the chain first: derived values are lazy, so without a read there is
+    // nothing cached for the write to invalidate selectively.
+    getState().finalPrice;
     subtotal.mockClear();
     total.mockClear();
     finalPrice.mockClear();
@@ -239,6 +245,7 @@ describe("derived", () => {
       },
     });
     subscribe(vi.fn());
+    getState().label;
     parity.mockClear();
     label.mockClear();
 
@@ -328,6 +335,52 @@ describe("old-snapshot derived reads", () => {
     expect(before.doubled).toBe(2);
 
     expect(doubled).not.toHaveBeenCalled();
+  });
+
+  it("does not let an old-snapshot read invalidate the live memo", () => {
+    const doubled = vi.fn((s: { count: number }) => s.count * 2);
+    const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled },
+    });
+
+    const first = getState();
+    expect(first.doubled).toBe(2);
+
+    setState({ count: 2 });
+    const middle = getState();
+    setState({ count: 1 });
+    const live = getState();
+
+    doubled.mockClear();
+    // A retained older snapshot has to compute its own value…
+    expect(middle.doubled).toBe(4);
+    expect(doubled).toHaveBeenCalledTimes(1);
+
+    doubled.mockClear();
+    // …but it must not retune the shared record to that older state. The live
+    // snapshot is back at count: 1, which is what the record already describes,
+    // so this read is a cache hit. Letting the stale read write the record made
+    // it describe count: 2 and forced this recompute for nothing.
+    expect(live.doubled).toBe(2);
+    expect(doubled).not.toHaveBeenCalled();
+  });
+
+  it("retries a derived value that threw", () => {
+    let boom = true;
+    const flaky = vi.fn((s: { count: number }) => {
+      if (boom) throw new Error("nope");
+      return s.count * 2;
+    });
+    const { getState } = createStore<{ count: number }, { flaky: number }>({
+      state: { count: 3 },
+      derived: { flaky },
+    });
+
+    expect(() => getState().flaky).toThrow("nope");
+    boom = false;
+    expect(getState().flaky).toBe(6);
+    expect(flaky).toHaveBeenCalledTimes(2);
   });
 
   it("keeps a stable reference per snapshot for object-returning derived values", () => {
@@ -498,41 +551,64 @@ describe("lazy/mount-aware derived recomputation", () => {
 // ─── circular dependency detection ────────────────────────────────────────────
 
 describe("circular dependency detection", () => {
-  it("throws for a 2-node cycle at creation", () => {
-    const create = () =>
-      createStore<Record<string, never>, { a: number; b: number }>({
-        state: {},
-        derived: {
-          a: (s) => s.b + 1,
-          b: (s) => s.a + 1,
-        },
-      });
+  // Derived values are lazy in every mode, so a cycle surfaces on the read that
+  // walks into it rather than at createStore. The message still names the whole
+  // chain, which is the part that makes it actionable.
+  it("throws for a 2-node cycle on read", () => {
+    const { getState } = createStore<Record<string, never>, { a: number; b: number }>({
+      state: {},
+      derived: {
+        a: (s) => s.b + 1,
+        b: (s) => s.a + 1,
+      },
+    });
 
-    expect(create).toThrow(new CircularDependencyError(["a", "b", "a"]));
+    expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 
   it("throws with the full chain for a 3-node cycle", () => {
-    const create = () =>
-      createStore<Record<string, never>, { A: number; B: number; C: number }>({
-        state: {},
-        derived: {
-          A: (s) => s.B + 1,
-          B: (s) => s.C + 1,
-          C: (s) => s.A + 1,
-        },
-      });
+    const { getState } = createStore<Record<string, never>, { A: number; B: number; C: number }>({
+      state: {},
+      derived: {
+        A: (s) => s.B + 1,
+        B: (s) => s.C + 1,
+        C: (s) => s.A + 1,
+      },
+    });
 
-    expect(create).toThrow(new CircularDependencyError(["A", "B", "C", "A"]));
+    expect(() => getState().A).toThrow(new CircularDependencyError(["A", "B", "C", "A"]));
+  });
+
+  it("reports the chain from whichever key the read entered on", () => {
+    const { getState } = createStore<Record<string, never>, { A: number; B: number; C: number }>({
+      state: {},
+      derived: {
+        A: (s) => s.B + 1,
+        B: (s) => s.C + 1,
+        C: (s) => s.A + 1,
+      },
+    });
+
+    expect(() => getState().B).toThrow(new CircularDependencyError(["B", "C", "A", "B"]));
   });
 
   it("throws for a derived key that depends on itself", () => {
+    const { getState } = createStore<Record<string, never>, { a: number }>({
+      state: {},
+      derived: { a: (s) => s.a + 1 },
+    });
+
+    expect(() => getState().a).toThrow(new CircularDependencyError(["a", "a"]));
+  });
+
+  it("creating a store with a cyclic config does not throw on its own", () => {
     const create = () =>
-      createStore<Record<string, never>, { a: number }>({
+      createStore<Record<string, never>, { a: number; b: number }>({
         state: {},
-        derived: { a: (s) => s.a + 1 },
+        derived: { a: (s) => s.b + 1, b: (s) => s.a + 1 },
       });
 
-    expect(create).toThrow(new CircularDependencyError(["a", "a"]));
+    expect(create).not.toThrow();
   });
 
   it("throws on read once a cycle only manifests via a later setState", () => {
@@ -552,7 +628,7 @@ describe("circular dependency detection", () => {
     expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 
-  it("defers the creation-time check to the first read in production builds", () => {
+  it("behaves the same in production builds", () => {
     vi.stubEnv("NODE_ENV", "production");
     try {
       const store = createStore<{ a: number }, { b: number; c: number }>({
@@ -863,10 +939,11 @@ describe("plugins", () => {
     expect(onInit).toHaveBeenCalledWith(
       expect.objectContaining({ getState: expect.any(Function) }),
     );
-    expect(onInit.mock.calls[0]?.[0].getState()).toEqual({
-      count: 0,
-      doubled: 0,
-    });
+    // Derived values are lazy, so an untouched snapshot carries only raw keys
+    // as own properties; `doubled` resolves through the prototype getter.
+    const state = onInit.mock.calls[0]?.[0].getState();
+    expect(state).toEqual({ count: 0 });
+    expect(state.doubled).toBe(0);
     store.destroy();
   });
 

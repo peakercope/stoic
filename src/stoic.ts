@@ -143,33 +143,19 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
   onDestroy?(): void;
 }
 
-// One memoization cell per derived key, shared across snapshots. `deps` records
-// (key, value-at-compute-time) pairs — flattened as [k0, v0, k1, v1, …] — from
-// the most recent compute; that compute is fresh for a snapshot when every
-// recorded dep value is still `Object.is`-equal on that snapshot (reading a
-// derived dep recurses through its own getter, so invalidation is transitive).
-// `derivedDeps` is set when any recorded dep is itself derived: only those
-// freshness checks can recurse, so raw-only cells skip the cycle guard. The
-// resolved value is pinned per snapshot as an own data property shadowing the
-// shared prototype getter, so code holding an older snapshot reads a stable,
-// correct value without thrashing the shared dep record — and repeat reads are
-// plain property accesses.
-type Cell = {
-  value: unknown;
-  deps: unknown[] | null;
-  derivedDeps: boolean;
-  computing: boolean;
-};
-
-// Adding an own property is a fast shape transition; redefining one (the old
-// design) drops the object into dictionary mode. Every dep value is re-read on
-// each freshness check, so `deps` stays deduped.
-const isFresh = (deps: unknown[], snap: Record<string, unknown>): boolean => {
-  for (let i = 0; i < deps.length; i += 2) {
-    if (!Object.is(deps[i + 1], snap[deps[i] as string])) return false;
-  }
-  return true;
-};
+// Memoization state for the derived keys lives in parallel arrays indexed by a
+// dense derived-key index rather than in one object per key: the prototype
+// getter closes over its index, so a read is an element load instead of a
+// string-keyed lookup that goes megamorphic once several stores exist.
+//
+// `deps[i]` records (key, value-at-compute-time) pairs — flattened as
+// [k0, v0, k1, v1, …] — from the most recent compute. That compute is fresh
+// for a snapshot when every recorded dep value is still `Object.is`-equal on
+// it; reading a derived dep recurses through its own getter, so invalidation
+// is transitive. The resolved value is pinned per snapshot as an own data
+// property shadowing the shared prototype getter, so code holding an older
+// snapshot reads a stable, correct value and repeat reads are plain property
+// accesses.
 
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
@@ -180,33 +166,47 @@ const DERIVED_KEYS = Symbol("stoic.derivedKeys");
 // Each store's readDerived lives as a plain data property on a per-store
 // intermediate prototype under this symbol, one hop below the shared getter
 // prototype: snap → store proto (readDerived slot) → shared getter proto.
-// The getters need nothing store-specific, so one getter prototype (cached
-// per `derived` config) serves every store built from that config, and
-// neither snapshots nor writes ever carry a per-snapshot slot — the old
-// design's non-enumerable defineProperty per snapshot took a slow attribute-
-// transition path on every accepted write.
+// The getters need nothing store-specific beyond the key index, so one getter
+// prototype serves every store with the same derived key names, and neither
+// snapshots nor writes ever carry a per-snapshot slot — the old design's
+// non-enumerable defineProperty per snapshot took a slow attribute-transition
+// path on every accepted write.
 const READ_DERIVED = Symbol("stoic.readDerived");
 
-type ReadDerived = (key: string, snap: object) => unknown;
+type ReadDerived = (index: number, snap: object) => unknown;
 type WithRead = { [READ_DERIVED]: ReadDerived };
 
-const PROTO_CACHE = new WeakMap<object, object>();
+// Keyed by the derived key names rather than by the `derived` config object.
+// A factory that builds its config inline — every createStoreContext store,
+// every per-request SSR store — hands createStore a fresh object every call and
+// would never hit an identity-keyed cache, which made those stores rebuild the
+// whole getter prototype from scratch. The getters depend on nothing except the
+// key names and their order, so every store declaring the same derived keys can
+// share one prototype. Bounded by the number of distinct derived key sets in
+// the program. (An identity cache in front of this one was measured and lost:
+// it costs a WeakMap store per created store, which the inline case — the one
+// that needed help — pays without ever reading back.)
+const PROTO_BY_NAMES = new Map<string, object>();
 
-const protoFor = (derivedConfig: object, derivedKeys: string[]): object => {
-  let proto = PROTO_CACHE.get(derivedConfig);
+const protoFor = (derivedKeys: string[]): object => {
+  // U+0000 cannot appear in a JS identifier and is vanishingly unlikely in a
+  // computed key, so joining on it keeps distinct key sets distinct.
+  const cacheKey = derivedKeys.join("\u0000");
+  let proto = PROTO_BY_NAMES.get(cacheKey);
   if (proto === undefined) {
     const descriptors: PropertyDescriptorMap = {};
-    for (const key of derivedKeys) {
-      descriptors[key] = {
+    for (let i = 0; i < derivedKeys.length; i++) {
+      const index = i;
+      descriptors[derivedKeys[i] as string] = {
         enumerable: true,
         configurable: true,
         get(this: WithRead) {
-          return this[READ_DERIVED](key, this);
+          return this[READ_DERIVED](index, this);
         },
       };
     }
     proto = Object.defineProperties({}, descriptors);
-    PROTO_CACHE.set(derivedConfig, proto);
+    PROTO_BY_NAMES.set(cacheKey, proto);
   }
   return proto;
 };
@@ -237,6 +237,30 @@ const pin = (snap: object, key: string, value: unknown) => {
 };
 
 const NOOP = () => {};
+
+// `computeParent` slot values: IDLE when a derived key is not being computed,
+// ROOT when its compute was started by a plain read rather than by another
+// derived value. Anything else is the index of the compute that triggered it.
+const IDLE = -2;
+const ROOT = -1;
+
+// Cold path — module level so it is not a closure allocated per store, and so
+// the message-building code stays out of every store's context.
+const cycleError = (
+  keys: string[],
+  parent: number[],
+  innermost: number,
+  index: number,
+): CircularDependencyError => {
+  const chain: string[] = [];
+  for (let at = innermost; at !== ROOT; at = parent[at] as number) {
+    chain.push(keys[at] as string);
+    if (at === index) break;
+  }
+  chain.reverse();
+  chain.push(keys[index] as string);
+  return new CircularDependencyError(chain);
+};
 
 /**
  * @internal Not part of the public API. Returns a copy — the store keeps using
@@ -326,18 +350,26 @@ export function createStore<T extends object, D extends object = Record<never, n
   let activeControllers: Set<AbortController> | null = null;
 
   // Derived-only structures are never allocated for state-only stores; every
-  // use is behind a hasDerived (or derived-read) path.
-  const cells: Record<string, Cell> = hasDerived ? {} : (null as never);
-  for (const key of derivedKeys) {
-    cells[key] = {
-      value: undefined,
-      deps: null,
-      derivedDeps: false,
-      computing: false,
-    };
+  // use is behind a hasDerived (or derived-read) path. Parallel arrays indexed
+  // by derived-key index, so a read is an element load rather than a
+  // string-keyed lookup on a shared dictionary.
+  const dValue: unknown[] = hasDerived ? [] : (null as never);
+  const dDeps: (unknown[] | null)[] = hasDerived ? [] : (null as never);
+  const dFns: ((s: Full) => unknown)[] = hasDerived ? [] : (null as never);
+  // Doubles as the cycle guard and as the chain used to describe a cycle once
+  // one is found. One element load replaces the old per-cell `computing`
+  // boolean *and* the string stack that existed only for the error message.
+  const computeParent: number[] = hasDerived ? [] : (null as never);
+  let computingNow = ROOT;
+
+  // One pass, pushing into arrays that stay packed, rather than four
+  // `new Array(n).fill(…)` calls plus a `.map` closure.
+  for (let i = 0; i < derivedKeys.length; i++) {
+    dValue.push(undefined);
+    dDeps.push(null);
+    dFns.push(derivedFns[derivedKeys[i] as string] as (s: Full) => unknown);
+    computeParent.push(IDLE);
   }
-  // Path of derived keys currently being computed, for cycle error messages.
-  const computeStack: string[] = hasDerived ? [] : (null as never);
 
   // One tracker object per store, retargeted around each compute via these
   // closure slots (computes nest when a derived fn reads another derived key,
@@ -374,30 +406,35 @@ export function createStore<T extends object, D extends object = Record<never, n
     return Object.defineProperties({}, descriptors) as Full;
   };
 
-  const readDerived = (key: string, snap: Full): unknown => {
-    const cell = cells[key] as Cell;
-    const deps = cell.deps;
-    // Fast path: a raw-only dep record cannot recurse, so its freshness check
-    // needs no cycle guard.
-    if (deps !== null && !cell.derivedDeps) {
-      if (isFresh(deps, snap as Record<string, unknown>)) {
-        pin(snap, key, cell.value);
-        return cell.value;
-      }
+  const readDerived = (index: number, snap: Full): unknown => {
+    const key = derivedKeys[index] as string;
+    // The whole body runs under the cycle guard. Freshness checking can recurse
+    // as readily as a recompute can — a derived dep is revalidated through its
+    // own getter — so guarding only the recompute would let a cycle discovered
+    // during revalidation run away.
+    if (computeParent[index] !== IDLE) {
+      throw cycleError(derivedKeys, computeParent, computingNow, index);
     }
-    if (cell.computing) {
-      throw new CircularDependencyError([...computeStack.slice(computeStack.indexOf(key)), key]);
-    }
-    // The guard covers revalidation too: reading a derived dep below recurses
-    // into its getter, and a conditional flip can only form a cycle through a
-    // recompute, which lands back here.
-    cell.computing = true;
-    computeStack.push(key);
+    computeParent[index] = computingNow;
+    const outer = computingNow;
+    computingNow = index;
     try {
-      if (deps !== null && cell.derivedDeps) {
-        if (isFresh(deps, snap as Record<string, unknown>)) {
-          pin(snap, key, cell.value);
-          return cell.value;
+      const deps = dDeps[index];
+      if (deps !== null) {
+        // A recorded compute is reusable for any snapshot on which every dep it
+        // read still has the same value — derived functions are pure, so that
+        // is exactly the condition for the cached value to be correct here.
+        let fresh = true;
+        for (let i = 0; i < deps.length; i += 2) {
+          if (!Object.is(deps[i + 1], (snap as Record<string, unknown>)[deps[i] as string])) {
+            fresh = false;
+            break;
+          }
+        }
+        if (fresh) {
+          const value = dValue[index];
+          pin(snap, key, value);
+          return value;
         }
       }
 
@@ -407,26 +444,37 @@ export function createStore<T extends object, D extends object = Record<never, n
       const recorded: unknown[] = [];
       trackDeps = recorded;
       if (tracker === null) tracker = makeTracker();
+      let value: unknown;
       try {
-        cell.value = (derivedFns[key] as (s: Full) => unknown)(tracker);
+        value = (dFns[index] as (s: Full) => unknown)(tracker);
+      } catch (err) {
+        // Keeps the invariant that `dDeps[i]`/`dValue[i]` always describe one
+        // completed compute. Nothing observable depends on it today — a pure
+        // derived function that throws for a given state throws again for that
+        // same state, so the leftover record can only be reused where it would
+        // have produced the same answer — but every cheaper freshness test
+        // (a dirty bit, a version stamp) does depend on it, and the cost here
+        // is a store on a path that is already unwinding.
+        dDeps[index] = null;
+        throw err;
       } finally {
         trackSnap = prevSnap;
         trackDeps = prevDeps;
       }
-      cell.deps = recorded;
-      let derivedDeps = false;
-      for (let i = 0; i < recorded.length; i += 2) {
-        if (Object.hasOwn(cells, recorded[i] as string)) {
-          derivedDeps = true;
-          break;
-        }
+
+      // Only the live snapshot owns the shared memo. A read against a snapshot
+      // someone is still holding computes and pins its own value but leaves the
+      // record alone — otherwise it would retune the cell to an older state and
+      // force the very next current-snapshot read to recompute.
+      if ((snap as object) === (snapshot as object)) {
+        dValue[index] = value;
+        dDeps[index] = recorded;
       }
-      cell.derivedDeps = derivedDeps;
-      pin(snap, key, cell.value);
-      return cell.value;
+      pin(snap, key, value);
+      return value;
     } finally {
-      cell.computing = false;
-      computeStack.pop();
+      computeParent[index] = IDLE;
+      computingNow = outer;
     }
   };
 
@@ -437,7 +485,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   // itself within ~a dozen writes.
   let derivedProto: object | null = null;
   if (hasDerived) {
-    derivedProto = Object.create(protoFor(config.derived as object, derivedKeys));
+    derivedProto = Object.create(protoFor(derivedKeys));
     (derivedProto as WithRead)[READ_DERIVED] = readDerived as ReadDerived;
   }
 
@@ -452,12 +500,13 @@ export function createStore<T extends object, D extends object = Record<never, n
   ) as Full;
   let destroyed = false;
 
-  // Dev-only: evaluate every derived key once so a statically cyclic config
-  // fails at creation instead of on first read. Production skips the eager
-  // pass — derived values stay lazy and a cycle still throws on read.
-  if (isDev) {
-    for (const key of derivedKeys) readDerived(key, snapshot);
-  }
+  // Derived values are lazy in development too. The eager pass that used to run
+  // here surfaced a statically cyclic config at creation rather than on first
+  // read, but it cost a full evaluation of every derived key per store and made
+  // dev and production disagree about when derived functions run — including
+  // how often, which made recompute assertions in user tests mode-dependent.
+  // A cycle still throws, with the same chain in the message, on the read that
+  // walks into it.
 
   const getState = () => snapshot;
 
@@ -543,7 +592,7 @@ export function createStore<T extends object, D extends object = Record<never, n
         // hidden class and the derived dep records exhaustive).
         if (isDev) {
           console.warn(
-            hasDerived && Object.hasOwn(cells, key)
+            derivedKeys.indexOf(key) !== -1
               ? `stoic: setState ignored derived key "${key}"; derived values are computed`
               : `stoic: setState ignored unknown key "${key}"; the state shape is fixed by \`state\` at creation`,
           );
