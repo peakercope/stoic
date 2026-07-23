@@ -339,6 +339,10 @@ const fmt = (ns) => (ns >= 1000 ? `${(ns / 1000).toFixed(2)} µs` : `${ns.toFixe
 
 function report(results, base) {
   const names = Object.keys(results);
+  if (names.length === 0) {
+    console.log("no cases matched (--filter is a plain substring, not a regex)");
+    return;
+  }
   const width = Math.max(...names.map((n) => n.length));
   console.log(`\n${"case".padEnd(width)}  ${"ns/op".padStart(10)}${base ? "  vs base" : ""}`);
   console.log("-".repeat(width + (base ? 22 : 12)));

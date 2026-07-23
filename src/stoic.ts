@@ -152,10 +152,12 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
 // [k0, v0, k1, v1, …] — from the most recent compute. That compute is fresh
 // for a snapshot when every recorded dep value is still `Object.is`-equal on
 // it; reading a derived dep recurses through its own getter, so invalidation
-// is transitive. The resolved value is pinned per snapshot as an own data
-// property shadowing the shared prototype getter, so code holding an older
-// snapshot reads a stable, correct value and repeat reads are plain property
-// accesses.
+// is transitive. This state describes the live snapshot only — see readDerived.
+//
+// Resolved values are then memoized per snapshot (see MEMO), which is what
+// makes a snapshot immutable in practice: whatever value it produced for a
+// derived key once is the value it produces forever, however much the store
+// has moved on since.
 
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
@@ -206,6 +208,11 @@ const protoFor = (derivedKeys: string[]): object => {
       };
     }
     proto = Object.defineProperties({}, descriptors);
+    // Shared with every store declaring these keys: it is only ever sliced,
+    // never mutated, so one per key-set is enough and no store pays to build it.
+    (proto as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE] = new Array(derivedKeys.length).fill(
+      EMPTY,
+    );
     PROTO_BY_NAMES.set(cacheKey, proto);
   }
   return proto;
@@ -225,15 +232,45 @@ const IDLE_META: ActionMeta = Object.freeze({ status: "idle", error: undefined }
 const PENDING_META: ActionMeta = Object.freeze({ status: "pending", error: undefined });
 const SUCCESS_META: ActionMeta = Object.freeze({ status: "success", error: undefined });
 
-const PIN_DESC: PropertyDescriptor = {
+// Resolved derived values are memoized per snapshot in one array hung off the
+// snapshot under a non-enumerable symbol, so a snapshot always answers with the
+// value it first produced and repeat reads never recompute.
+//
+// The array costs one Object.defineProperty for the whole snapshot, on the
+// first derived read that lands on it. The obvious alternative — defining the
+// resolved value directly on the snapshot under its own key, shadowing the
+// prototype getter — costs one defineProperty *per key*, and defineProperty is
+// roughly 80ns against 4ns for an ordinary array store, whether or not it
+// shadows an accessor. One attach plus N cheap stores beats N attaches for
+// every snapshot on which more than one derived key is ever read.
+//
+// Non-enumerable, so it stays out of Object.keys, JSON.stringify, object
+// spreads and toEqual — the reason this is a symbol rather than a string key,
+// and non-enumerable rather than merely symbol-keyed (spreads copy own
+// enumerable symbols).
+const MEMO = Symbol("stoic.memo");
+const MEMO_TEMPLATE = Symbol("stoic.memoTemplate");
+// Derived values may legitimately be undefined, so absence needs its own token.
+const EMPTY = Symbol("stoic.empty");
+
+const MEMO_DESC: PropertyDescriptor = {
   value: undefined,
-  enumerable: true,
+  enumerable: false,
   configurable: true,
+  writable: true,
 };
-const pin = (snap: object, key: string, value: unknown) => {
-  PIN_DESC.value = value;
-  Object.defineProperty(snap, key, PIN_DESC);
-  PIN_DESC.value = undefined;
+// Cloned from a per-store template rather than built fresh: slicing a small
+// packed array measured ~11ns against ~18ns for `new Array(n).fill(EMPTY)`.
+// The template is reached through the snapshot's prototype instead of a closure
+// variable — a slot in createStore's context is paid for by every store,
+// including state-only ones that never attach a memo, and that measured ~18ns
+// per store creation.
+const attachMemo = (snap: object): unknown[] => {
+  const memo = (snap as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE].slice();
+  MEMO_DESC.value = memo;
+  Object.defineProperty(snap, MEMO, MEMO_DESC);
+  MEMO_DESC.value = undefined;
+  return memo;
 };
 
 const NOOP = () => {};
@@ -427,9 +464,23 @@ export function createStore<T extends object, D extends object = Record<never, n
     return Object.defineProperties({}, descriptors) as Full;
   };
 
+  // The memo is re-read rather than carried down from the top of readDerived:
+  // computing this key may have read a derived dep off the same snapshot, and
+  // that nested read is what attached the array.
+  const remember = (snap: Full, index: number, value: unknown) => {
+    const memo = (snap as { [MEMO]?: unknown[] })[MEMO] ?? attachMemo(snap);
+    memo[index] = value;
+  };
+
   const readDerived = (index: number, snap: Full): unknown => {
-    const key = derivedKeys[index] as string;
-    // The whole body runs under the cycle guard. Freshness checking can recurse
+    // Whatever this snapshot has already resolved is final — snapshots are
+    // immutable, so a value it produced once is the value it produces forever.
+    const memo = (snap as { [MEMO]?: unknown[] })[MEMO];
+    if (memo !== undefined) {
+      const cached = memo[index];
+      if (cached !== EMPTY) return cached;
+    }
+    // The rest runs under the cycle guard. Freshness checking can recurse
     // as readily as a recompute can — a derived dep is revalidated through its
     // own getter — so guarding only the recompute would let a cycle discovered
     // during revalidation run away.
@@ -454,7 +505,7 @@ export function createStore<T extends object, D extends object = Record<never, n
         }
         if (fresh) {
           const value = dValue[index];
-          pin(snap, key, value);
+          remember(snap, index, value);
           return value;
         }
       }
@@ -491,7 +542,7 @@ export function createStore<T extends object, D extends object = Record<never, n
         dValue[index] = value;
         dDeps[index] = recorded;
       }
-      pin(snap, key, value);
+      remember(snap, index, value);
       return value;
     } finally {
       computeParent[index] = IDLE;

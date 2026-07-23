@@ -256,39 +256,51 @@ describe("derived", () => {
     expect(label).not.toHaveBeenCalled();
   });
 
-  it("exposes a derived key as a lazy enumerable getter that self-memoizes into a data property on first read", () => {
+  it("exposes a derived key as a lazy enumerable getter and computes it at most once per snapshot", () => {
     const doubled = vi.fn((s: { count: number }) => s.count * 2);
     const { getState, setState } = createStore<{ count: number }, { doubled: number }>({
       state: { count: 3 },
       derived: { doubled },
     });
 
-    // A fresh snapshot (past the dev-only eager pass at creation) exposes the
-    // derived key as an enumerable getter on its prototype chain (per-store
-    // proto → shared getter proto); inspecting it computes nothing and the
-    // snapshot has no own property yet.
+    // A fresh snapshot exposes the derived key as an enumerable getter on its
+    // prototype chain (per-store proto → shared getter proto); inspecting it
+    // computes nothing and the snapshot has no own property for it.
     setState({ count: 4 });
     const snapshot = getState();
     doubled.mockClear();
     expect(Object.getOwnPropertyDescriptor(snapshot, "doubled")).toBeUndefined();
     const proto = Object.getPrototypeOf(Object.getPrototypeOf(snapshot) as object) as object;
-    const before = Object.getOwnPropertyDescriptor(proto, "doubled");
-    expect(before?.get).toBeTypeOf("function");
-    expect(before?.enumerable).toBe(true);
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "doubled");
+    expect(descriptor?.get).toBeTypeOf("function");
+    expect(descriptor?.enumerable).toBe(true);
     expect("doubled" in snapshot).toBe(true);
     expect(doubled).not.toHaveBeenCalled();
 
-    // The first read pins the value as a plain enumerable data property, so
-    // repeat reads on this snapshot are plain property accesses.
     expect(snapshot.doubled).toBe(8);
-    const after = Object.getOwnPropertyDescriptor(snapshot, "doubled");
-    expect(after?.get).toBeUndefined();
-    expect(after?.value).toBe(8);
-    expect(after?.enumerable).toBe(true);
+    expect(snapshot.doubled).toBe(8);
+    expect(snapshot.doubled).toBe(8);
+    expect(doubled).toHaveBeenCalledTimes(1);
 
+    // Raw keys are ordinary own data properties.
     const rawDesc = Object.getOwnPropertyDescriptor(snapshot, "count");
     expect(rawDesc?.get).toBeUndefined();
     expect(rawDesc?.value).toBe(4);
+  });
+
+  it("keeps the per-snapshot memo out of enumeration, spreads and serialization", () => {
+    const { getState } = createStore<{ count: number; name: string }, { doubled: number }>({
+      state: { count: 4, name: "a" },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+
+    const snapshot = getState();
+    expect(snapshot.doubled).toBe(8);
+
+    expect(Object.keys(snapshot)).toEqual(["count", "name"]);
+    expect({ ...snapshot }).toEqual({ count: 4, name: "a" });
+    expect(JSON.parse(JSON.stringify(snapshot))).toEqual({ count: 4, name: "a" });
+    expect(snapshot).toEqual({ count: 4, name: "a" });
   });
 
   it("tracks non-string (symbol) property reads on the proxied state without adding them as dependencies", () => {
