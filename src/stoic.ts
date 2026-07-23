@@ -236,9 +236,16 @@ const pin = (snap: object, key: string, value: unknown) => {
   PIN_DESC.value = undefined;
 };
 
-/** @internal Not part of the public API. */
-export const derivedKeysOf = (store: object): readonly string[] =>
-  (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS] ?? [];
+const NOOP = () => {};
+
+/**
+ * @internal Not part of the public API. Returns a copy — the store keeps using
+ * its own list, so a plugin cannot reorder or truncate it.
+ */
+export const derivedKeysOf = (store: object): readonly string[] => {
+  const keys = (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS];
+  return keys === undefined ? [] : keys.slice();
+};
 
 /**
  * Creates a store from initial `state`, optional `derived` values, and
@@ -286,13 +293,15 @@ export function createStore<T extends object, D extends object = Record<never, n
       );
     }
   }
-  const plugins = config.plugins ?? [];
   // Per-hook plugin lists, resolved once: the hot paths skip hook dispatch (and
   // the event-object allocation) entirely when no plugin implements a hook.
+  // These lists are also the store's only reference to the plugins, so mutating
+  // the caller's `plugins` array afterwards can't change hook dispatch.
   let afterSetStateHooks: StoicPlugin<T, Full>[] | null = null;
   let beforeActionHooks: StoicPlugin<T, Full>[] | null = null;
   let afterActionHooks: StoicPlugin<T, Full>[] | null = null;
-  for (const p of plugins) {
+  let destroyHooks: StoicPlugin<T, Full>[] | null = null;
+  for (const p of config.plugins ?? []) {
     if (p.afterSetState) {
       afterSetStateHooks ??= [];
       afterSetStateHooks.push(p);
@@ -304,6 +313,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     if (p.afterAction) {
       afterActionHooks ??= [];
       afterActionHooks.push(p);
+    }
+    if (p.onDestroy) {
+      destroyHooks ??= [];
+      destroyHooks.push(p);
     }
   }
 
@@ -483,10 +496,23 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     notifyDepth++;
     try {
+      // A hook or listener may write state, which re-enters notify and delivers
+      // the newer snapshot to *everyone*. When that happens this pass is over:
+      // continuing it would hand the same final state a second time to whoever
+      // is ordered after the writer (duplicate devtools entries, duplicate
+      // persist writes). Snapshot identity is the signal — the core mints a new
+      // object for every accepted write.
+      const seen = snapshot;
       if (afterSetStateHooks !== null) {
-        for (const p of afterSetStateHooks) p.afterSetState?.(snapshot, actionName, actionArgs);
+        for (const p of afterSetStateHooks) {
+          p.afterSetState?.(snapshot, actionName, actionArgs);
+          if (snapshot !== seen) return;
+        }
       }
-      for (const l of listeners) l(snapshot);
+      for (const l of listeners) {
+        l(snapshot);
+        if (snapshot !== seen) return;
+      }
     } finally {
       notifyDepth--;
     }
@@ -498,6 +524,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
+    // Writing the current snapshot back is a no-op by definition, and the
+    // `for…in` below would otherwise walk the snapshot's prototype chain and
+    // evaluate every derived getter on it just to reject each one. An *older*
+    // snapshot is not a no-op and deliberately still goes the long way.
+    if ((next as unknown) === snapshot) return;
 
     const snap = snapshot as Record<string, unknown>;
     let nextSnap: Record<string, unknown> | null = null;
@@ -568,7 +599,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   const subscribe = (listener: Listener<Full>) => {
     if (destroyed) {
       if (isDev) console.warn("stoic: subscribe called on a destroyed store; ignored");
-      return () => {};
+      return NOOP;
     }
     listeners.add(listener);
     return () => listeners.delete(listener);
@@ -745,7 +776,9 @@ export function createStore<T extends object, D extends object = Record<never, n
       for (const controller of activeControllers) controller.abort();
       activeControllers.clear();
     }
-    for (const p of plugins) p.onDestroy?.();
+    if (destroyHooks !== null) {
+      for (const p of destroyHooks) p.onDestroy?.();
+    }
     listeners.clear();
   };
 
@@ -762,7 +795,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     [DERIVED_KEYS]: derivedKeys,
   } as StoicStore<T, Full>;
 
-  for (const p of plugins) p.onInit?.(store);
+  for (const p of config.plugins ?? []) p.onInit?.(store);
 
   return store;
 }

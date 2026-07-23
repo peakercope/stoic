@@ -1873,6 +1873,94 @@ describe("re-entrant updates during notification", () => {
     expect(() => store.setState({ count: 1 })).toThrow(/maximum update depth/);
     warnSpy.mockRestore();
   });
+
+  it("notifies each listener after the writer exactly once with the final state", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore<{ count: number; mirror: number }>({
+      state: { count: 0, mirror: 0 },
+    });
+
+    const before: number[][] = [];
+    const after: number[][] = [];
+    store.subscribe((s) => before.push([s.count, s.mirror]));
+    store.subscribe((s) => {
+      if (s.mirror !== s.count) store.setState({ mirror: s.count });
+    });
+    store.subscribe((s) => after.push([s.count, s.mirror]));
+
+    store.setState({ count: 3 });
+
+    // The listener ordered before the writer genuinely observed two states.
+    expect(before).toEqual([
+      [3, 0],
+      [3, 3],
+    ]);
+    // The one after it must see the final state once — not the same state twice.
+    expect(after).toEqual([[3, 3]]);
+    warnSpy.mockRestore();
+  });
+
+  it("runs afterSetState once per plugin when another plugin writes during the hook", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const later = vi.fn();
+    let store!: ReturnType<typeof createStore<{ count: number; mirror: number }>>;
+    store = createStore<{ count: number; mirror: number }>({
+      state: { count: 0, mirror: 0 },
+      plugins: [
+        {
+          afterSetState(state) {
+            if (state.mirror !== state.count) store.setState({ mirror: state.count });
+          },
+        },
+        { afterSetState: later },
+      ],
+    });
+
+    store.setState({ count: 2 });
+
+    expect(store.getState()).toEqual({ count: 2, mirror: 2 });
+    expect(later).toHaveBeenCalledTimes(1);
+    expect(later).toHaveBeenCalledWith({ count: 2, mirror: 2 }, undefined, undefined);
+    warnSpy.mockRestore();
+  });
+
+  it("does not re-notify when the re-entrant write happens inside a batch", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = createStore<{ count: number; mirror: number }>({
+      state: { count: 0, mirror: 0 },
+    });
+
+    const after: number[][] = [];
+    store.subscribe((s) => {
+      if (s.mirror !== s.count) {
+        store.batch(() => {
+          store.setState({ mirror: s.count });
+        });
+      }
+    });
+    store.subscribe((s) => after.push([s.count, s.mirror]));
+
+    store.setState({ count: 5 });
+
+    expect(after).toEqual([[5, 5]]);
+    warnSpy.mockRestore();
+  });
+
+  it("leaves a no-op re-entrant write from a listener notifying normally", () => {
+    const store = createStore<{ count: number; other: number }>({ state: { count: 0, other: 7 } });
+
+    const after: number[] = [];
+    store.subscribe(() => {
+      // Writes the value the key already holds, so no new snapshot is minted
+      // and the outer pass must run to completion.
+      store.setState({ other: 7 });
+    });
+    store.subscribe((s) => after.push(s.count));
+
+    store.setState({ count: 1 });
+
+    expect(after).toEqual([1]);
+  });
 });
 
 describe("prototype-named state keys", () => {
