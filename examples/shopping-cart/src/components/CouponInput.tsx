@@ -21,7 +21,7 @@ export function CouponInput() {
     );
   }
 
-  function onSubmit(event: React.SubmitEvent) {
+  function onSubmit(event: React.SyntheticEvent<HTMLFormElement>) {
     event.preventDefault();
     // Coupons are just data, so we validate here and hand the store a real
     // Coupon object — the store never has to know which codes exist.
