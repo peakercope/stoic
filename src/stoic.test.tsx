@@ -2023,6 +2023,50 @@ describe("re-entrant updates during notification", () => {
     warnSpy.mockRestore();
   });
 
+  it("does not call a listener that unsubscribed during the same notification", () => {
+    const store = createStore({ state: { count: 0 } });
+    const late = vi.fn();
+    store.subscribe(() => {
+      unsubscribeLate();
+    });
+    const unsubscribeLate = store.subscribe(late);
+
+    store.setState({ count: 1 });
+
+    expect(late).not.toHaveBeenCalled();
+  });
+
+  it("does not call a listener subscribed during the notification that added it", () => {
+    const store = createStore({ state: { count: 0 } });
+    const added = vi.fn();
+    let subscribed = false;
+    store.subscribe(() => {
+      if (!subscribed) {
+        subscribed = true;
+        store.subscribe(added);
+      }
+    });
+
+    store.setState({ count: 1 });
+    expect(added).not.toHaveBeenCalled();
+
+    // …but it is part of the next one.
+    store.setState({ count: 2 });
+    expect(added).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops notifying when a listener destroys the store mid-dispatch", () => {
+    const store = createStore({ state: { count: 0 } });
+    const later = vi.fn();
+    store.subscribe(() => {
+      store.destroy();
+    });
+    store.subscribe(later);
+
+    expect(() => store.setState({ count: 1 })).not.toThrow();
+    expect(later).not.toHaveBeenCalled();
+  });
+
   it("leaves a no-op re-entrant write from a listener notifying normally", () => {
     const store = createStore<{ count: number; other: number }>({ state: { count: 0, other: 7 } });
 

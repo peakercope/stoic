@@ -108,6 +108,20 @@ const CASES = {
       };
     },
   },
+  // A React app of any size has far more than eight live subscribers, and
+  // per-listener dispatch cost is what scales there.
+  "set:state-only-64l": {
+    iters: 5e5,
+    setup: (createStore) => {
+      const store = createStore({ state: state3() });
+      for (let l = 0; l < 64; l++) store.subscribe(() => {});
+      let i = 0;
+      return () => {
+        store.setState({ count: i++ });
+        return 0;
+      };
+    },
+  },
   "set:derived-unread": {
     iters: 3e6,
     setup: (createStore) => {
