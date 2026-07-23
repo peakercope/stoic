@@ -26,7 +26,7 @@ Yes. `useStore` is built on `useSyncExternalStore`, React's sanctioned way to re
 
 ## What happens if my derived values depend on each other in a cycle?
 
-Stoic throws a `CircularDependencyError` describing the cycle, instead of recomputing forever — in development at store creation when the cycle is always present, otherwise on the read of the cyclic value.
+Stoic throws a `CircularDependencyError` describing the cycle, instead of recomputing forever. Derived values are lazy, so the error surfaces on the read that walks into the cycle rather than at `createStore`.
 
 ## Why isn't my derived value recomputing?
 

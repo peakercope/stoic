@@ -492,7 +492,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     computingNow = index;
     try {
       const deps = dDeps[index];
-      if (deps !== null) {
+      if (deps !== null && deps !== undefined) {
         // A recorded compute is reusable for any snapshot on which every dep it
         // read still has the same value — derived functions are pure, so that
         // is exactly the condition for the cached value to be correct here.
