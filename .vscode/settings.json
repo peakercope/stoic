@@ -8,5 +8,5 @@
     "editor.defaultFormatter": "biomejs.biome"
   },
   "biome.lsp.bin": "./node_modules/@biomejs/cli-darwin-arm64/biome",
-  "js/ts.tsdk.path": "node_modules/typescript/lib"
+  "js/ts.tsdk.path": "./node_modules/typescript/lib"
 }
