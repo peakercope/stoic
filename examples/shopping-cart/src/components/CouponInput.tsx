@@ -1,4 +1,4 @@
-import { type SubmitEvent, useState } from "react";
+import { useState } from "react";
 import { useStore } from "stoic-store/react";
 import { coupons } from "../data";
 import { applyCoupon, cart, removeCoupon } from "../store";
@@ -21,7 +21,7 @@ export function CouponInput() {
     );
   }
 
-  function onSubmit(event: SubmitEvent) {
+  function onSubmit(event: React.SyntheticEvent<HTMLFormElement>) {
     event.preventDefault();
     // Coupons are just data, so we validate here and hand the store a real
     // Coupon object — the store never has to know which codes exist.

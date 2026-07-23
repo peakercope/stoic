@@ -143,33 +143,21 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
   onDestroy?(): void;
 }
 
-// One memoization cell per derived key, shared across snapshots. `deps` records
-// (key, value-at-compute-time) pairs — flattened as [k0, v0, k1, v1, …] — from
-// the most recent compute; that compute is fresh for a snapshot when every
-// recorded dep value is still `Object.is`-equal on that snapshot (reading a
-// derived dep recurses through its own getter, so invalidation is transitive).
-// `derivedDeps` is set when any recorded dep is itself derived: only those
-// freshness checks can recurse, so raw-only cells skip the cycle guard. The
-// resolved value is pinned per snapshot as an own data property shadowing the
-// shared prototype getter, so code holding an older snapshot reads a stable,
-// correct value without thrashing the shared dep record — and repeat reads are
-// plain property accesses.
-type Cell = {
-  value: unknown;
-  deps: unknown[] | null;
-  derivedDeps: boolean;
-  computing: boolean;
-};
-
-// Adding an own property is a fast shape transition; redefining one (the old
-// design) drops the object into dictionary mode. Every dep value is re-read on
-// each freshness check, so `deps` stays deduped.
-const isFresh = (deps: unknown[], snap: Record<string, unknown>): boolean => {
-  for (let i = 0; i < deps.length; i += 2) {
-    if (!Object.is(deps[i + 1], snap[deps[i] as string])) return false;
-  }
-  return true;
-};
+// Memoization state for the derived keys lives in parallel arrays indexed by a
+// dense derived-key index rather than in one object per key: the prototype
+// getter closes over its index, so a read is an element load instead of a
+// string-keyed lookup that goes megamorphic once several stores exist.
+//
+// `deps[i]` records (key, value-at-compute-time) pairs — flattened as
+// [k0, v0, k1, v1, …] — from the most recent compute. That compute is fresh
+// for a snapshot when every recorded dep value is still `Object.is`-equal on
+// it; reading a derived dep recurses through its own getter, so invalidation
+// is transitive. This state describes the live snapshot only — see readDerived.
+//
+// Resolved values are then memoized per snapshot (see MEMO), which is what
+// makes a snapshot immutable in practice: whatever value it produced for a
+// derived key once is the value it produces forever, however much the store
+// has moved on since.
 
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
@@ -180,33 +168,52 @@ const DERIVED_KEYS = Symbol("stoic.derivedKeys");
 // Each store's readDerived lives as a plain data property on a per-store
 // intermediate prototype under this symbol, one hop below the shared getter
 // prototype: snap → store proto (readDerived slot) → shared getter proto.
-// The getters need nothing store-specific, so one getter prototype (cached
-// per `derived` config) serves every store built from that config, and
-// neither snapshots nor writes ever carry a per-snapshot slot — the old
-// design's non-enumerable defineProperty per snapshot took a slow attribute-
-// transition path on every accepted write.
+// The getters need nothing store-specific beyond the key index, so one getter
+// prototype serves every store with the same derived key names, and neither
+// snapshots nor writes ever carry a per-snapshot slot — the old design's
+// non-enumerable defineProperty per snapshot took a slow attribute-transition
+// path on every accepted write.
 const READ_DERIVED = Symbol("stoic.readDerived");
 
-type ReadDerived = (key: string, snap: object) => unknown;
+type ReadDerived = (index: number, snap: object) => unknown;
 type WithRead = { [READ_DERIVED]: ReadDerived };
 
-const PROTO_CACHE = new WeakMap<object, object>();
+// Keyed by the derived key names rather than by the `derived` config object.
+// A factory that builds its config inline — every createStoreContext store,
+// every per-request SSR store — hands createStore a fresh object every call and
+// would never hit an identity-keyed cache, which made those stores rebuild the
+// whole getter prototype from scratch. The getters depend on nothing except the
+// key names and their order, so every store declaring the same derived keys can
+// share one prototype. Bounded by the number of distinct derived key sets in
+// the program. (An identity cache in front of this one was measured and lost:
+// it costs a WeakMap store per created store, which the inline case — the one
+// that needed help — pays without ever reading back.)
+const PROTO_BY_NAMES = new Map<string, object>();
 
-const protoFor = (derivedConfig: object, derivedKeys: string[]): object => {
-  let proto = PROTO_CACHE.get(derivedConfig);
+const protoFor = (derivedKeys: string[]): object => {
+  // U+0000 cannot appear in a JS identifier and is vanishingly unlikely in a
+  // computed key, so joining on it keeps distinct key sets distinct.
+  const cacheKey = derivedKeys.join("\u0000");
+  let proto = PROTO_BY_NAMES.get(cacheKey);
   if (proto === undefined) {
     const descriptors: PropertyDescriptorMap = {};
-    for (const key of derivedKeys) {
-      descriptors[key] = {
+    for (let i = 0; i < derivedKeys.length; i++) {
+      const index = i;
+      descriptors[derivedKeys[i] as string] = {
         enumerable: true,
         configurable: true,
         get(this: WithRead) {
-          return this[READ_DERIVED](key, this);
+          return this[READ_DERIVED](index, this);
         },
       };
     }
     proto = Object.defineProperties({}, descriptors);
-    PROTO_CACHE.set(derivedConfig, proto);
+    // Shared with every store declaring these keys: it is only ever sliced,
+    // never mutated, so one per key-set is enough and no store pays to build it.
+    (proto as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE] = new Array(derivedKeys.length).fill(
+      EMPTY,
+    );
+    PROTO_BY_NAMES.set(cacheKey, proto);
   }
   return proto;
 };
@@ -225,20 +232,81 @@ const IDLE_META: ActionMeta = Object.freeze({ status: "idle", error: undefined }
 const PENDING_META: ActionMeta = Object.freeze({ status: "pending", error: undefined });
 const SUCCESS_META: ActionMeta = Object.freeze({ status: "success", error: undefined });
 
-const PIN_DESC: PropertyDescriptor = {
+// Resolved derived values are memoized per snapshot in one array hung off the
+// snapshot under a non-enumerable symbol, so a snapshot always answers with the
+// value it first produced and repeat reads never recompute.
+//
+// The array costs one Object.defineProperty for the whole snapshot, on the
+// first derived read that lands on it. The obvious alternative — defining the
+// resolved value directly on the snapshot under its own key, shadowing the
+// prototype getter — costs one defineProperty *per key*, and defineProperty is
+// roughly 80ns against 4ns for an ordinary array store, whether or not it
+// shadows an accessor. One attach plus N cheap stores beats N attaches for
+// every snapshot on which more than one derived key is ever read.
+//
+// Non-enumerable, so it stays out of Object.keys, JSON.stringify, object
+// spreads and toEqual — the reason this is a symbol rather than a string key,
+// and non-enumerable rather than merely symbol-keyed (spreads copy own
+// enumerable symbols).
+const MEMO = Symbol("stoic.memo");
+const MEMO_TEMPLATE = Symbol("stoic.memoTemplate");
+// Derived values may legitimately be undefined, so absence needs its own token.
+const EMPTY = Symbol("stoic.empty");
+
+const MEMO_DESC: PropertyDescriptor = {
   value: undefined,
-  enumerable: true,
+  enumerable: false,
   configurable: true,
+  writable: true,
 };
-const pin = (snap: object, key: string, value: unknown) => {
-  PIN_DESC.value = value;
-  Object.defineProperty(snap, key, PIN_DESC);
-  PIN_DESC.value = undefined;
+// Cloned from a per-store template rather than built fresh: slicing a small
+// packed array measured ~11ns against ~18ns for `new Array(n).fill(EMPTY)`.
+// The template is reached through the snapshot's prototype instead of a closure
+// variable — a slot in createStore's context is paid for by every store,
+// including state-only ones that never attach a memo, and that measured ~18ns
+// per store creation.
+const attachMemo = (snap: object): unknown[] => {
+  const memo = (snap as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE].slice();
+  MEMO_DESC.value = memo;
+  Object.defineProperty(snap, MEMO, MEMO_DESC);
+  MEMO_DESC.value = undefined;
+  return memo;
 };
 
-/** @internal Not part of the public API. */
-export const derivedKeysOf = (store: object): readonly string[] =>
-  (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS] ?? [];
+const NOOP = () => {};
+
+// `computeParent` slot values: IDLE when a derived key is not being computed,
+// ROOT when its compute was started by a plain read rather than by another
+// derived value. Anything else is the index of the compute that triggered it.
+const IDLE = -2;
+const ROOT = -1;
+
+// Cold path — module level so it is not a closure allocated per store, and so
+// the message-building code stays out of every store's context.
+const cycleError = (
+  keys: string[],
+  parent: number[],
+  innermost: number,
+  index: number,
+): CircularDependencyError => {
+  const chain: string[] = [];
+  for (let at = innermost; at !== ROOT; at = parent[at] as number) {
+    chain.push(keys[at] as string);
+    if (at === index) break;
+  }
+  chain.reverse();
+  chain.push(keys[index] as string);
+  return new CircularDependencyError(chain);
+};
+
+/**
+ * @internal Not part of the public API. Returns a copy — the store keeps using
+ * its own list, so a plugin cannot reorder or truncate it.
+ */
+export const derivedKeysOf = (store: object): readonly string[] => {
+  const keys = (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS];
+  return keys === undefined ? [] : keys.slice();
+};
 
 /**
  * Creates a store from initial `state`, optional `derived` values, and
@@ -286,13 +354,15 @@ export function createStore<T extends object, D extends object = Record<never, n
       );
     }
   }
-  const plugins = config.plugins ?? [];
   // Per-hook plugin lists, resolved once: the hot paths skip hook dispatch (and
   // the event-object allocation) entirely when no plugin implements a hook.
+  // These lists are also the store's only reference to the plugins, so mutating
+  // the caller's `plugins` array afterwards can't change hook dispatch.
   let afterSetStateHooks: StoicPlugin<T, Full>[] | null = null;
   let beforeActionHooks: StoicPlugin<T, Full>[] | null = null;
   let afterActionHooks: StoicPlugin<T, Full>[] | null = null;
-  for (const p of plugins) {
+  let destroyHooks: StoicPlugin<T, Full>[] | null = null;
+  for (const p of config.plugins ?? []) {
     if (p.afterSetState) {
       afterSetStateHooks ??= [];
       afterSetStateHooks.push(p);
@@ -305,26 +375,59 @@ export function createStore<T extends object, D extends object = Record<never, n
       afterActionHooks ??= [];
       afterActionHooks.push(p);
     }
+    if (p.onDestroy) {
+      destroyHooks ??= [];
+      destroyHooks.push(p);
+    }
   }
 
-  const listeners = new Set<Listener<Full>>();
+  // Subscribers in dispatch order, with unsubscribed slots held as null until
+  // it is safe to compact them away. Dispatching from an array rather than a
+  // Set drops the iterator allocation every notification paid and makes each
+  // step a single element load, which is what dominates once a real tree has a
+  // few dozen subscribers. Unsubscribing stays immediate — a listener removed
+  // mid-notification is skipped by the null check — at the cost of an indexOf
+  // scan per unsubscribe, which happens orders of magnitude less often than
+  // dispatch does.
+  const subs: Listener<Full>[] = [];
+  let liveSubs = 0;
+  // Cleared slots are compacted away only between notifications, never while a
+  // dispatch is walking the array.
+  let dispatchDepth = 0;
+  const compact = () => {
+    if (dispatchDepth !== 0 || subs.length === liveSubs) return;
+    let write = 0;
+    for (let i = 0; i < subs.length; i++) {
+      const fn = subs[i];
+      if (fn !== NOOP) subs[write++] = fn as Listener<Full>;
+    }
+    subs.length = write;
+  };
   // Controllers of in-flight action calls that read `ctx.signal`, so destroy()
   // can abort them all. Allocated on the first signal read.
   let activeControllers: Set<AbortController> | null = null;
 
   // Derived-only structures are never allocated for state-only stores; every
-  // use is behind a hasDerived (or derived-read) path.
-  const cells: Record<string, Cell> = hasDerived ? {} : (null as never);
-  for (const key of derivedKeys) {
-    cells[key] = {
-      value: undefined,
-      deps: null,
-      derivedDeps: false,
-      computing: false,
-    };
+  // use is behind a hasDerived (or derived-read) path. Parallel arrays indexed
+  // by derived-key index, so a read is an element load rather than a
+  // string-keyed lookup on a shared dictionary.
+  const dValue: unknown[] = hasDerived ? [] : (null as never);
+  const dDeps: (unknown[] | null)[] = hasDerived ? [] : (null as never);
+  const dFns: ((s: Full) => unknown)[] = hasDerived ? [] : (null as never);
+  // Doubles as the cycle guard and as the chain used to describe a cycle once
+  // one is found. One element load replaces the old per-cell `computing`
+  // boolean *and* the string stack that existed only for the error message.
+  const computeParent: number[] = hasDerived ? [] : (null as never);
+  let computingNow = ROOT;
+
+  // One pass, pushing into arrays that stay packed, rather than four
+  // `new Array(n).fill(…)` calls plus a `.map` closure.
+  for (let i = 0; i < derivedKeys.length; i++) {
+    dValue.push(undefined);
+    dDeps.push(null);
+    dFns.push(derivedFns[derivedKeys[i] as string] as (s: Full) => unknown);
+    computeParent.push(IDLE);
   }
-  // Path of derived keys currently being computed, for cycle error messages.
-  const computeStack: string[] = hasDerived ? [] : (null as never);
 
   // One tracker object per store, retargeted around each compute via these
   // closure slots (computes nest when a derived fn reads another derived key,
@@ -361,30 +464,49 @@ export function createStore<T extends object, D extends object = Record<never, n
     return Object.defineProperties({}, descriptors) as Full;
   };
 
-  const readDerived = (key: string, snap: Full): unknown => {
-    const cell = cells[key] as Cell;
-    const deps = cell.deps;
-    // Fast path: a raw-only dep record cannot recurse, so its freshness check
-    // needs no cycle guard.
-    if (deps !== null && !cell.derivedDeps) {
-      if (isFresh(deps, snap as Record<string, unknown>)) {
-        pin(snap, key, cell.value);
-        return cell.value;
-      }
+  // The memo is re-read rather than carried down from the top of readDerived:
+  // computing this key may have read a derived dep off the same snapshot, and
+  // that nested read is what attached the array.
+  const remember = (snap: Full, index: number, value: unknown) => {
+    const memo = (snap as { [MEMO]?: unknown[] })[MEMO] ?? attachMemo(snap);
+    memo[index] = value;
+  };
+
+  const readDerived = (index: number, snap: Full): unknown => {
+    // Whatever this snapshot has already resolved is final — snapshots are
+    // immutable, so a value it produced once is the value it produces forever.
+    const memo = (snap as { [MEMO]?: unknown[] })[MEMO];
+    if (memo !== undefined) {
+      const cached = memo[index];
+      if (cached !== EMPTY) return cached;
     }
-    if (cell.computing) {
-      throw new CircularDependencyError([...computeStack.slice(computeStack.indexOf(key)), key]);
+    // The rest runs under the cycle guard. Freshness checking can recurse
+    // as readily as a recompute can — a derived dep is revalidated through its
+    // own getter — so guarding only the recompute would let a cycle discovered
+    // during revalidation run away.
+    if (computeParent[index] !== IDLE) {
+      throw cycleError(derivedKeys, computeParent, computingNow, index);
     }
-    // The guard covers revalidation too: reading a derived dep below recurses
-    // into its getter, and a conditional flip can only form a cycle through a
-    // recompute, which lands back here.
-    cell.computing = true;
-    computeStack.push(key);
+    computeParent[index] = computingNow;
+    const outer = computingNow;
+    computingNow = index;
     try {
-      if (deps !== null && cell.derivedDeps) {
-        if (isFresh(deps, snap as Record<string, unknown>)) {
-          pin(snap, key, cell.value);
-          return cell.value;
+      const deps = dDeps[index];
+      if (deps !== null && deps !== undefined) {
+        // A recorded compute is reusable for any snapshot on which every dep it
+        // read still has the same value — derived functions are pure, so that
+        // is exactly the condition for the cached value to be correct here.
+        let fresh = true;
+        for (let i = 0; i < deps.length; i += 2) {
+          if (!Object.is(deps[i + 1], (snap as Record<string, unknown>)[deps[i] as string])) {
+            fresh = false;
+            break;
+          }
+        }
+        if (fresh) {
+          const value = dValue[index];
+          remember(snap, index, value);
+          return value;
         }
       }
 
@@ -394,26 +516,37 @@ export function createStore<T extends object, D extends object = Record<never, n
       const recorded: unknown[] = [];
       trackDeps = recorded;
       if (tracker === null) tracker = makeTracker();
+      let value: unknown;
       try {
-        cell.value = (derivedFns[key] as (s: Full) => unknown)(tracker);
+        value = (dFns[index] as (s: Full) => unknown)(tracker);
+      } catch (err) {
+        // Keeps the invariant that `dDeps[i]`/`dValue[i]` always describe one
+        // completed compute. Nothing observable depends on it today — a pure
+        // derived function that throws for a given state throws again for that
+        // same state, so the leftover record can only be reused where it would
+        // have produced the same answer — but every cheaper freshness test
+        // (a dirty bit, a version stamp) does depend on it, and the cost here
+        // is a store on a path that is already unwinding.
+        dDeps[index] = null;
+        throw err;
       } finally {
         trackSnap = prevSnap;
         trackDeps = prevDeps;
       }
-      cell.deps = recorded;
-      let derivedDeps = false;
-      for (let i = 0; i < recorded.length; i += 2) {
-        if (Object.hasOwn(cells, recorded[i] as string)) {
-          derivedDeps = true;
-          break;
-        }
+
+      // Only the live snapshot owns the shared memo. A read against a snapshot
+      // someone is still holding computes and pins its own value but leaves the
+      // record alone — otherwise it would retune the cell to an older state and
+      // force the very next current-snapshot read to recompute.
+      if ((snap as object) === (snapshot as object)) {
+        dValue[index] = value;
+        dDeps[index] = recorded;
       }
-      cell.derivedDeps = derivedDeps;
-      pin(snap, key, cell.value);
-      return cell.value;
+      remember(snap, index, value);
+      return value;
     } finally {
-      cell.computing = false;
-      computeStack.pop();
+      computeParent[index] = IDLE;
+      computingNow = outer;
     }
   };
 
@@ -424,7 +557,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   // itself within ~a dozen writes.
   let derivedProto: object | null = null;
   if (hasDerived) {
-    derivedProto = Object.create(protoFor(config.derived as object, derivedKeys));
+    derivedProto = Object.create(protoFor(derivedKeys));
     (derivedProto as WithRead)[READ_DERIVED] = readDerived as ReadDerived;
   }
 
@@ -439,12 +572,13 @@ export function createStore<T extends object, D extends object = Record<never, n
   ) as Full;
   let destroyed = false;
 
-  // Dev-only: evaluate every derived key once so a statically cyclic config
-  // fails at creation instead of on first read. Production skips the eager
-  // pass — derived values stay lazy and a cycle still throws on read.
-  if (isDev) {
-    for (const key of derivedKeys) readDerived(key, snapshot);
-  }
+  // Derived values are lazy in development too. The eager pass that used to run
+  // here surfaced a statically cyclic config at creation rather than on first
+  // read, but it cost a full evaluation of every derived key per store and made
+  // dev and production disagree about when derived functions run — including
+  // how often, which made recompute assertions in user tests mode-dependent.
+  // A cycle still throws, with the same chain in the message, on the read that
+  // walks into it.
 
   const getState = () => snapshot;
 
@@ -483,10 +617,38 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     notifyDepth++;
     try {
+      // A hook or listener may write state, which re-enters notify and delivers
+      // the newer snapshot to *everyone*. When that happens this pass is over:
+      // continuing it would hand the same final state a second time to whoever
+      // is ordered after the writer (duplicate devtools entries, duplicate
+      // persist writes). Snapshot identity is the signal — the core mints a new
+      // object for every accepted write.
+      const seen = snapshot;
       if (afterSetStateHooks !== null) {
-        for (const p of afterSetStateHooks) p.afterSetState?.(snapshot, actionName, actionArgs);
+        for (const p of afterSetStateHooks) {
+          p.afterSetState?.(snapshot, actionName, actionArgs);
+          if (snapshot !== seen) return;
+        }
       }
-      for (const l of listeners) l(snapshot);
+      // Iterating a cached array rather than the Set avoids allocating a Set
+      // iterator per notification, and it fixes the dispatch list for the
+      // duration of this pass: a listener subscribed by another listener
+      // belongs to the next change, not this one. Removal still takes effect
+      // immediately — a component unmounting mid-notification must not be
+      // called — so each entry is re-checked against the live Set.
+      // The length is read once: a listener subscribed by another listener
+      // belongs to the next change, not to this one.
+      dispatchDepth++;
+      try {
+        const n = subs.length;
+        for (let i = 0; i < n; i++) {
+          (subs[i] as Listener<Full>)(snapshot);
+          if (snapshot !== seen) return;
+        }
+      } finally {
+        dispatchDepth--;
+        compact();
+      }
     } finally {
       notifyDepth--;
     }
@@ -498,6 +660,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
+    // Writing the current snapshot back is a no-op by definition, and the
+    // `for…in` below would otherwise walk the snapshot's prototype chain and
+    // evaluate every derived getter on it just to reject each one. An *older*
+    // snapshot is not a no-op and deliberately still goes the long way.
+    if ((next as unknown) === snapshot) return;
 
     const snap = snapshot as Record<string, unknown>;
     let nextSnap: Record<string, unknown> | null = null;
@@ -512,7 +679,7 @@ export function createStore<T extends object, D extends object = Record<never, n
         // hidden class and the derived dep records exhaustive).
         if (isDev) {
           console.warn(
-            hasDerived && Object.hasOwn(cells, key)
+            derivedKeys.indexOf(key) !== -1
               ? `stoic: setState ignored derived key "${key}"; derived values are computed`
               : `stoic: setState ignored unknown key "${key}"; the state shape is fixed by \`state\` at creation`,
           );
@@ -568,11 +735,24 @@ export function createStore<T extends object, D extends object = Record<never, n
   const subscribe = (listener: Listener<Full>) => {
     if (destroyed) {
       if (isDev) console.warn("stoic: subscribe called on a destroyed store; ignored");
-      return () => {};
+      return NOOP;
     }
-    listeners.add(listener);
-    return () => listeners.delete(listener);
+    subs.push(listener);
+    liveSubs++;
+    let removed = false;
+    return () => {
+      if (removed) return;
+      removed = true;
+      const at = subs.indexOf(listener);
+      if (at !== -1) subs[at] = NOOP;
+      liveSubs--;
+      compact();
+    };
   };
+
+  // Action attribution exists to tell afterSetState which action produced a
+  // write. With no such hook the whole mechanism is unobservable.
+  const attributed = afterSetStateHooks !== null;
 
   const createActionRunner = (name: string, fn: (...args: unknown[]) => unknown) => {
     let meta: ActionMeta = IDLE_META;
@@ -595,33 +775,39 @@ export function createStore<T extends object, D extends object = Record<never, n
 
     // One context class per runner: call contexts are monomorphic instances
     // with the `signal` accessor on the prototype instead of a fresh accessor
-    // object per invocation. `set` and `get` stay per-call/closure functions
-    // because actions destructure them off the context.
+    // object per invocation. `set` and `get` are prototype properties rather
+    // than class fields — actions destructure them off the context, so they
+    // must not need a receiver, but neither varies per call.
     class CallCtx implements ActionCtx<T, Full> {
+      declare set: SetState<T, Full>;
+      declare get: () => Full;
       callId: number;
       args: unknown[];
       // Lazy: allocated only when the action reads `ctx.signal`.
       controller: AbortController | null = null;
-      // Attribution wraps each write, not the action body: only writes made
-      // through this action's `set` are credited to it, and the credit
-      // survives `await`s and overlapping actions.
-      set: SetState<T, Full> = (partial) => {
-        const prevName = currentActionName;
-        const prevArgs = currentActionArgs;
-        currentActionName = name;
-        currentActionArgs = this.args;
-        try {
-          setState(partial);
-        } finally {
-          currentActionName = prevName;
-          currentActionArgs = prevArgs;
-        }
-      };
-      get = getState;
 
       constructor(callId: number, args: unknown[]) {
         this.callId = callId;
         this.args = args;
+        // Attribution wraps each write, not the action body: only writes made
+        // through this action's `set` are credited to it, and the credit
+        // survives `await`s and overlapping actions. It costs a closure per
+        // call, so it is only installed when something can actually observe it
+        // — `currentActionName`/`Args` are read solely by afterSetState hooks.
+        if (attributed) {
+          this.set = (partial) => {
+            const prevName = currentActionName;
+            const prevArgs = currentActionArgs;
+            currentActionName = name;
+            currentActionArgs = args;
+            try {
+              setState(partial);
+            } finally {
+              currentActionName = prevName;
+              currentActionArgs = prevArgs;
+            }
+          };
+        }
       }
 
       get signal(): AbortSignal {
@@ -662,6 +848,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
     }
 
+    CallCtx.prototype.get = getState;
+    // Without an afterSetState hook nothing reads the attribution, so writes go
+    // straight through and no per-call closure is built at all.
+    if (!attributed) CallCtx.prototype.set = setState;
+
     const runner = (...args: unknown[]) => {
       if (currentController !== null) {
         activeControllers?.delete(currentController);
@@ -677,13 +868,28 @@ export function createStore<T extends object, D extends object = Record<never, n
       }
 
       const callId = ++latestCall;
+      // Announced before the action body runs, not after: an async action that
+      // writes state before its first `await` notifies subscribers from inside
+      // that body, and they must already see `pending` there — that write is
+      // usually exactly what puts a spinner on screen. Skipping it for calls
+      // that turn out to be synchronous measured ~2ns on action:sync, which is
+      // not worth making the async case wrong.
       setMeta(callId, PENDING_META);
-
       const ctx = new CallCtx(callId, args);
 
       let result: unknown;
       try {
-        result = fn(ctx, ...args);
+        // Spelling out the low arities keeps these calls off the spread path,
+        // which builds an argument list at run time. Actions take 0–2 arguments
+        // almost always; anything longer falls back.
+        result =
+          args.length === 0
+            ? fn(ctx)
+            : args.length === 1
+              ? fn(ctx, args[0])
+              : args.length === 2
+                ? fn(ctx, args[0], args[1])
+                : fn(ctx, ...args);
       } catch (err) {
         ctx.settle({ status: "error", error: err });
         throw err;
@@ -745,8 +951,15 @@ export function createStore<T extends object, D extends object = Record<never, n
       for (const controller of activeControllers) controller.abort();
       activeControllers.clear();
     }
-    for (const p of plugins) p.onDestroy?.();
-    listeners.clear();
+    if (destroyHooks !== null) {
+      for (const p of destroyHooks) p.onDestroy?.();
+    }
+    // Retire the slots rather than truncating: destroy() is reachable from
+    // inside a listener, and the dispatch loop above is holding a length it
+    // read before this ran. compact() drops them once no dispatch is walking.
+    for (let i = 0; i < subs.length; i++) subs[i] = NOOP;
+    liveSubs = 0;
+    compact();
   };
 
   // The symbol sits in the literal so the store object gets its final shape
@@ -762,7 +975,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     [DERIVED_KEYS]: derivedKeys,
   } as StoicStore<T, Full>;
 
-  for (const p of plugins) p.onInit?.(store);
+  for (const p of config.plugins ?? []) p.onInit?.(store);
 
   return store;
 }
