@@ -1,9 +1,10 @@
-// Isolated A/B benchmark runner for the built `dist`.
+// Isolated A/B benchmark runner for the built `dist`. The only benchmark
+// harness in this repo.
 //
-// `vitest bench` runs every case in one process, where composite cases (batch,
-// fan-out, actions) pick up phantom ±7–27% swings that reverse in clean runs.
-// This runner spawns one child process per case instead, so a case only ever
-// shares an isolate with itself.
+// Running every case in one process lets composite cases (batch, fan-out,
+// actions) pick up phantom ±7–27% swings that reverse in clean runs. This
+// runner spawns one child process per case instead, so a case only ever shares
+// an isolate with itself.
 //
 //   node scripts/bench.mjs                     run every case, print a table
 //   node scripts/bench.mjs --save base.json    …and write the numbers to a file
