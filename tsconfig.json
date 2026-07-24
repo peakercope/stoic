@@ -13,5 +13,11 @@
     "emitDeclarationOnly": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Benchmarks import the built output on purpose, so they only typecheck once
+  // `dist` exists — and the suppressions they need then read as unused. CI
+  // typechecks before it builds, so the file would flip between the two states
+  // depending on whether anyone had run a build. `scripts/bench.mjs` is the
+  // harness the perf work is actually measured with.
+  "exclude": ["src/stoic.bench.tsx"]
 }

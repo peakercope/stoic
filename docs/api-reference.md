@@ -27,7 +27,7 @@ function createStore<T extends object, D extends object>(config: {
 
 Builds a store. Stores with derived state need both type parameters spelled out — see [TypeScript](./typescript.md).
 
-Throws if `state` and `derived` share a key, or if the derived config is cyclic (see [`CircularDependencyError`](#circulardependencyerror)).
+Throws if `state` and `derived` share a key. A cyclic derived config throws on the first read that walks into the cycle, not here — see [`CircularDependencyError`](#circulardependencyerror).
 
 ### The store
 
@@ -35,12 +35,20 @@ Throws if `state` and `derived` share a key, or if the derived config is cyclic 
 | --- | --- |
 | `getState()` | Returns the current state, including derived values. |
 | `setState(partial)` | Merges a partial state — or the result of an updater `(state) => partial` — and notifies subscribers. Derived keys are ignored with a dev warning. |
-| `subscribe(listener)` | Calls `listener(state)` after every change; returns an unsubscribe function. |
+| `subscribe(listener)` | Calls `listener(state)` after every change; returns an unsubscribe function. Subscribing the same function twice registers it twice. |
 | `actions(map)` | Turns a map of `(ctx, ...args)` functions into callable [action handles](./actions.md). |
 | `batch(fn)` | Runs `fn`, coalescing all notifications into one (see [Batching](./batching.md)). |
 | `destroy()` | Aborts in-flight action signals, runs plugin `onDestroy` hooks, and drops all listeners. |
 
 After `destroy()`, `setState` and `subscribe` are no-ops with a development warning.
+
+### Notification order
+
+Listeners are called in subscription order, and the set of listeners for a change is fixed when that change starts being delivered:
+
+- **Unsubscribing takes effect immediately.** A listener unsubscribed during a notification — including by an earlier listener — is not called for it.
+- **Subscribing does not.** A listener added during a notification starts with the *next* change, not the one in flight.
+- **A `setState` made from inside a listener or plugin hook takes over.** The nested write notifies everyone with the new state, and the interrupted pass stops rather than delivering that same state a second time. Listeners ordered before the writer therefore see both states — the one that triggered the write, then the final one — and listeners after it see only the final one.
 
 ### Action handles
 
@@ -53,7 +61,7 @@ After `destroy()`, `setState` and `subscribe` are no-ops with a development warn
 
 ### `CircularDependencyError`
 
-Thrown when derived values depend on each other in a cycle, with a message describing the cycle — in development at store creation if the cycle is always present, otherwise on the read of the cyclic value.
+Thrown when derived values depend on each other in a cycle, with a message describing the cycle. Derived values are lazy, so it surfaces on the read that walks into the cycle.
 
 ## `stoic-store/react`
 

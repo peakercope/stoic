@@ -55,13 +55,28 @@ Tracking is **per top-level state key**. A derived function that reads `s.items`
 1. **Update state immutably.** Mutating an array in place (`s.items.push(...)`) keeps the same reference, so nothing downstream recomputes. Every example in these docs produces a new array/object instead.
 2. **Read inputs as properties** (`s.count`); dependency tracking doesn't see `Object.keys(s)` or `"count" in s`.
 
-Derived values are computed **lazily**: a derived key does its work the first time it's read after a relevant change, and the result is memoized until a dependency actually changes. Declaration order doesn't matter — a derived key can freely read another derived key declared before or after it; reads resolve recursively through the dependency graph. (The one exception to laziness: in development builds, every derived key is evaluated once at store creation so a statically cyclic configuration fails immediately; production builds skip that pass and stay fully lazy.)
+Derived values are computed **lazily**: a derived key does its work the first time it's read after a relevant change, and the result is memoized until a dependency actually changes. Declaration order doesn't matter — a derived key can freely read another derived key declared before or after it; reads resolve recursively through the dependency graph. Laziness is the same in development and production builds.
+
+Because a derived value is computed on read, it is not an own property of the state object until something reads it. That matters when you compare a whole state object rather than the values you care about:
+
+```ts
+const state = store.getState();
+
+Object.keys(state); // raw state keys only
+{ ...state };       // raw state keys only
+state.total;        // 42 — always correct, whether or not it was read before
+
+expect(store.getState()).toEqual({ items, total: 42 }); // ✗ total isn't an own key
+expect(store.getState().total).toBe(42);                // ✓ assert the value
+```
+
+> State objects must not be frozen. `Object.freeze(store.getState())` makes the first read of any derived value throw, because reading is what stores the memoized result on the object.
 
 > Derived functions should be **pure** — no side effects, no reading clocks or randomness. An impure derived value only recomputes when its tracked dependencies change, so anything else it reads goes stale silently.
 
 ## Rules and errors
 
-> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle — in development at store creation if the cycle is always present, otherwise on the read of the cyclic value.
+> If two derived keys end up depending on each other in a cycle, Stoic throws a `CircularDependencyError` describing the cycle, on the read that walks into it.
 
 > A key can't be both state and derived: `createStore` throws if `state` and `derived` share a key, since the derived getter would silently shadow the state value.
 
