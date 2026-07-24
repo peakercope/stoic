@@ -1,4 +1,4 @@
-import { isDevEnv } from "../env";
+import { DEV } from "../env";
 import { derivedKeysOf, type StoicPlugin, type StoicStore } from "../stoic";
 
 type MaybePromise<T> = T | Promise<T>;
@@ -189,7 +189,7 @@ export function persist<T extends object>(options: {
   const unavailable = () => {
     if (disabled) return;
     disabled = true;
-    if (isDevEnv()) {
+    if (DEV) {
       console.warn(
         `Stoic persist plugin: storage is unavailable for "${options.key}"; persistence is disabled for this store`,
       );
@@ -328,7 +328,7 @@ export function persist<T extends object>(options: {
   const hydrate = () => {
     const store = boundStore;
     if (store === undefined) {
-      if (isDevEnv()) {
+      if (DEV) {
         console.warn(
           "Stoic persist plugin: rehydrate() called before the plugin was attached to a " +
             "store (pass it via createStore's `plugins`); ignored",
@@ -388,7 +388,7 @@ export function persist<T extends object>(options: {
           } catch {
             unavailable();
           }
-        } else if (isDevEnv()) {
+        } else if (DEV) {
           console.warn(
             `Stoic persist plugin: \`sync\` is set for "${options.key}" but the driver has no ` +
               "`subscribe`; cross-context sync is disabled",

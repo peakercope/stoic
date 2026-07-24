@@ -1,4 +1,4 @@
-import { isDevEnv } from "./env";
+import { DEV } from "./env";
 
 export type Listener<T> = (state: T) => void;
 
@@ -154,77 +154,116 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
 // it; reading a derived dep recurses through its own getter, so invalidation
 // is transitive. This state describes the live snapshot only — see readDerived.
 //
-// Resolved values are then memoized per snapshot (see MEMO), which is what
-// makes a snapshot immutable in practice: whatever value it produced for a
-// derived key once is the value it produces forever, however much the store
-// has moved on since.
+// Resolved values are then memoized per snapshot (the `#memo` field on the
+// snapshot class), which is what makes a snapshot immutable in practice:
+// whatever value it produced for a derived key once is the value it produces
+// forever, however much the store has moved on since.
 
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
 // can't inspect snapshot property descriptors instead — derived getters live
-// on a shared prototype and self-memoize into plain data properties on read.
+// on a shared prototype and resolve into a private field.
 const DERIVED_KEYS = Symbol("stoic.derivedKeys");
 
-// Each store's readDerived lives as a plain data property on a per-store
-// intermediate prototype under this symbol, one hop below the shared getter
-// prototype: snap → store proto (readDerived slot) → shared getter proto.
-// The getters need nothing store-specific beyond the key index, so one getter
-// prototype serves every store with the same derived key names, and neither
-// snapshots nor writes ever carry a per-snapshot slot — the old design's
-// non-enumerable defineProperty per snapshot took a slow attribute-transition
-// path on every accepted write.
-const READ_DERIVED = Symbol("stoic.readDerived");
+// Derived values may legitimately be undefined, so absence needs its own token.
+const EMPTY = Symbol("stoic.empty");
 
 type ReadDerived = (index: number, snap: object) => unknown;
-type WithRead = { [READ_DERIVED]: ReadDerived };
+
+// The snapshot class for one set of derived key names. Snapshots are class
+// instances rather than `Object.create(proto)` objects because the two
+// per-snapshot slots the engine needs — the owning store's `readDerived`, and
+// the resolved-value memo — are **private fields**, the only per-object slot
+// that is both invisible (nothing leaks into `Object.keys`, spreads,
+// `JSON.stringify` or `toEqual`) and free to install. Both alternatives were
+// measured and are worse: an own enumerable symbol leaks into user spreads and
+// into `toEqual`, and `Object.defineProperty` costs ~90 ns *per snapshot*.
+type SnapCtor = {
+  new (read: ReadDerived): object;
+  read(snap: object, index: number): unknown;
+  memo(snap: object): unknown[] | null;
+  memoInit(snap: object): unknown[];
+};
 
 // Keyed by the derived key names rather than by the `derived` config object.
 // A factory that builds its config inline — every createStoreContext store,
 // every per-request SSR store — hands createStore a fresh object every call and
 // would never hit an identity-keyed cache, which made those stores rebuild the
-// whole getter prototype from scratch. The getters depend on nothing except the
+// whole getter prototype from scratch. The class depends on nothing except the
 // key names and their order, so every store declaring the same derived keys can
-// share one prototype. Bounded by the number of distinct derived key sets in
-// the program. (An identity cache in front of this one was measured and lost:
-// it costs a WeakMap store per created store, which the inline case — the one
-// that needed help — pays without ever reading back.)
-const PROTO_BY_NAMES = new Map<string, object>();
+// share one. Bounded by the number of distinct derived key sets in the program.
+// (An identity cache in front of this one was measured and lost: it costs a
+// WeakMap store per created store, which the inline case — the one that needed
+// help — pays without ever reading back.)
+//
+// Sharing it is the whole point. A *fresh* object promoted to prototype makes
+// V8 build new prototype info and a new map transition tree, so each of the
+// first snapshot's property stores minted a brand-new map: ~800 ns per store,
+// which was 70% of the cost of creating a store with derived values.
+//
+// A trie of Maps, one level per key name, rather than a flat Map keyed on the
+// joined names: building the join key measured ~59 ns for three keys against
+// ~13 ns for the walk, and it was the largest single item left in creating a
+// store with derived values. The class hangs off its node under a symbol, so it
+// can never collide with a key name.
+type ClassTrie = Map<string | symbol, ClassTrie | SnapCtor>;
+const CLASS_TRIE: ClassTrie = new Map();
+const TRIE_END = Symbol("stoic.trieEnd");
 
-const protoFor = (derivedKeys: string[]): object => {
-  // U+0000 cannot appear in a JS identifier and is vanishingly unlikely in a
-  // computed key, so joining on it keeps distinct key sets distinct.
-  const cacheKey = derivedKeys.join("\u0000");
-  let proto = PROTO_BY_NAMES.get(cacheKey);
-  if (proto === undefined) {
+const snapClassFor = (derivedKeys: string[]): SnapCtor => {
+  let node = CLASS_TRIE;
+  for (let i = 0; i < derivedKeys.length; i++) {
+    const key = derivedKeys[i] as string;
+    let next = node.get(key) as ClassTrie | undefined;
+    if (next === undefined) {
+      next = new Map();
+      node.set(key, next);
+    }
+    node = next;
+  }
+  let cls = node.get(TRIE_END) as SnapCtor | undefined;
+  if (cls === undefined) {
+    // Shared with every store declaring these keys: it is only ever sliced,
+    // never mutated, so one per key-set is enough and no store pays to build it.
+    const template: unknown[] = new Array(derivedKeys.length).fill(EMPTY);
+    class Snap {
+      #read: ReadDerived;
+      // Allocated by the first derived read that lands on this snapshot, so a
+      // snapshot that is written and never read pays nothing for it.
+      #memo: unknown[] | null = null;
+      constructor(read: ReadDerived) {
+        this.#read = read;
+      }
+      static read(snap: Snap, index: number): unknown {
+        return snap.#read(index, snap);
+      }
+      static memo(snap: Snap): unknown[] | null {
+        return snap.#memo;
+      }
+      static memoInit(snap: Snap): unknown[] {
+        const memo = template.slice();
+        snap.#memo = memo;
+        return memo;
+      }
+    }
     const descriptors: PropertyDescriptorMap = {};
     for (let i = 0; i < derivedKeys.length; i++) {
       const index = i;
       descriptors[derivedKeys[i] as string] = {
         enumerable: true,
         configurable: true,
-        get(this: WithRead) {
-          return this[READ_DERIVED](index, this);
+        get(this: Snap) {
+          return Snap.read(this, index);
         },
       };
     }
-    proto = Object.defineProperties({}, descriptors);
-    // Shared with every store declaring these keys: it is only ever sliced,
-    // never mutated, so one per key-set is enough and no store pays to build it.
-    (proto as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE] = new Array(derivedKeys.length).fill(
-      EMPTY,
-    );
-    PROTO_BY_NAMES.set(cacheKey, proto);
+    Object.defineProperties(Snap.prototype, descriptors);
+    cls = Snap as unknown as SnapCtor;
+    node.set(TRIE_END, cls);
   }
-  return proto;
+  return cls;
 };
 
-// Pins a resolved derived value on the snapshot as an own data property,
-// shadowing the prototype getter. Non-writable (like the getter it shadows);
-// enumerable/configurable must be spelled out — this adds a property rather
-// than reconfiguring one, so nothing carries over. The descriptor object is
-// reused across pins and cleared after, so a pin allocates nothing and
-// retains nothing (measured: writable/all-true attributes bought nothing —
-// pin cost is dwarfed by the recompute around it).
 // Shared, frozen meta singletons: every non-error outcome is one of these,
 // so a sync action call allocates no meta objects at all. Error metas carry
 // a per-call `error` and stay allocated.
@@ -232,48 +271,10 @@ const IDLE_META: ActionMeta = Object.freeze({ status: "idle", error: undefined }
 const PENDING_META: ActionMeta = Object.freeze({ status: "pending", error: undefined });
 const SUCCESS_META: ActionMeta = Object.freeze({ status: "success", error: undefined });
 
-// Resolved derived values are memoized per snapshot in one array hung off the
-// snapshot under a non-enumerable symbol, so a snapshot always answers with the
-// value it first produced and repeat reads never recompute.
-//
-// The array costs one Object.defineProperty for the whole snapshot, on the
-// first derived read that lands on it. The obvious alternative — defining the
-// resolved value directly on the snapshot under its own key, shadowing the
-// prototype getter — costs one defineProperty *per key*, and defineProperty is
-// roughly 80ns against 4ns for an ordinary array store, whether or not it
-// shadows an accessor. One attach plus N cheap stores beats N attaches for
-// every snapshot on which more than one derived key is ever read.
-//
-// Non-enumerable, so it stays out of Object.keys, JSON.stringify, object
-// spreads and toEqual — the reason this is a symbol rather than a string key,
-// and non-enumerable rather than merely symbol-keyed (spreads copy own
-// enumerable symbols).
-const MEMO = Symbol("stoic.memo");
-const MEMO_TEMPLATE = Symbol("stoic.memoTemplate");
-// Derived values may legitimately be undefined, so absence needs its own token.
-const EMPTY = Symbol("stoic.empty");
-
-const MEMO_DESC: PropertyDescriptor = {
-  value: undefined,
-  enumerable: false,
-  configurable: true,
-  writable: true,
-};
-// Cloned from a per-store template rather than built fresh: slicing a small
-// packed array measured ~11ns against ~18ns for `new Array(n).fill(EMPTY)`.
-// The template is reached through the snapshot's prototype instead of a closure
-// variable — a slot in createStore's context is paid for by every store,
-// including state-only ones that never attach a memo, and that measured ~18ns
-// per store creation.
-const attachMemo = (snap: object): unknown[] => {
-  const memo = (snap as { [MEMO_TEMPLATE]: unknown[] })[MEMO_TEMPLATE].slice();
-  MEMO_DESC.value = memo;
-  Object.defineProperty(snap, MEMO, MEMO_DESC);
-  MEMO_DESC.value = undefined;
-  return memo;
-};
-
 const NOOP = () => {};
+
+// Handed to every state-only store as its derived key list; never mutated.
+const NO_KEYS: string[] = [];
 
 // `computeParent` slot values: IDLE when a derived key is not being computed,
 // ROOT when its compute was started by a plain read rather than by another
@@ -336,17 +337,20 @@ export function createStore<T extends object, D extends object = Record<never, n
 }) {
   type Full = T & D;
 
-  const isDev = isDevEnv();
-
-  const derivedFns = (config.derived ?? {}) as Record<string, (s: Full) => unknown>;
-  const derivedKeys = Object.keys(derivedFns);
+  // Guarded rather than `config.derived ?? {}`: the fallback object and the
+  // `Object.keys` call on it are pure waste for a state-only store. The shared
+  // empty list is safe to hand out because nothing ever mutates it —
+  // `derivedKeysOf` copies before returning.
+  const derivedFns = config.derived as Record<string, (s: Full) => unknown> | undefined;
+  const derivedKeys = derivedFns === undefined ? NO_KEYS : Object.keys(derivedFns);
   const hasDerived = derivedKeys.length > 0;
   // The state shape is fixed at creation: setState only applies these keys.
   // `initialState` doubles as the membership check (hasOwn beats a Set here —
   // no extra allocation at creation, same lookup cost per written key).
   const initialState = config.state as Record<string, unknown>;
   const rawKeys = Object.keys(config.state);
-  for (const key of derivedKeys) {
+  for (let i = 0; i < derivedKeys.length; i++) {
+    const key = derivedKeys[i] as string;
     if (Object.hasOwn(config.state, key)) {
       throw new Error(
         `stoic: "${key}" is declared in both \`state\` and \`derived\`. The derived getter ` +
@@ -362,7 +366,11 @@ export function createStore<T extends object, D extends object = Record<never, n
   let beforeActionHooks: StoicPlugin<T, Full>[] | null = null;
   let afterActionHooks: StoicPlugin<T, Full>[] | null = null;
   let destroyHooks: StoicPlugin<T, Full>[] | null = null;
-  for (const p of config.plugins ?? []) {
+  // Read once and guarded rather than `?? []`: the fallback array and its
+  // iterator are allocated by every plugin-less store, which is most of them.
+  const plugins = config.plugins;
+  for (let i = 0; plugins !== undefined && i < plugins.length; i++) {
+    const p = plugins[i] as StoicPlugin<T, Full>;
     if (p.afterSetState) {
       afterSetStateHooks ??= [];
       afterSetStateHooks.push(p);
@@ -411,6 +419,10 @@ export function createStore<T extends object, D extends object = Record<never, n
   // use is behind a hasDerived (or derived-read) path. Parallel arrays indexed
   // by derived-key index, so a read is an element load rather than a
   // string-keyed lookup on a shared dictionary.
+  //
+  // The snapshot class is shared by every store declaring these derived keys,
+  // so this is a cache lookup rather than a build.
+  const snapClass: SnapCtor = hasDerived ? snapClassFor(derivedKeys) : (null as never);
   const dValue: unknown[] = hasDerived ? [] : (null as never);
   const dDeps: (unknown[] | null)[] = hasDerived ? [] : (null as never);
   const dFns: ((s: Full) => unknown)[] = hasDerived ? [] : (null as never);
@@ -422,10 +434,17 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   // One pass, pushing into arrays that stay packed, rather than four
   // `new Array(n).fill(…)` calls plus a `.map` closure.
+  //
+  // Folding `dValue` into slot 0 of the deps record — one array fewer per store
+  // and one slot fewer here — was measured and reverted: it bought 44 ns of
+  // one-time store creation and cost 2.1 ns on every *repeat* read of an
+  // already-memoized derived value (2.3 → 4.4 ns), which is the hottest read a
+  // React tree makes.
+  const fns = derivedFns as Record<string, (s: Full) => unknown>;
   for (let i = 0; i < derivedKeys.length; i++) {
     dValue.push(undefined);
     dDeps.push(null);
-    dFns.push(derivedFns[derivedKeys[i] as string] as (s: Full) => unknown);
+    dFns.push(fns[derivedKeys[i] as string] as (s: Full) => unknown);
     computeParent.push(IDLE);
   }
 
@@ -468,15 +487,15 @@ export function createStore<T extends object, D extends object = Record<never, n
   // computing this key may have read a derived dep off the same snapshot, and
   // that nested read is what attached the array.
   const remember = (snap: Full, index: number, value: unknown) => {
-    const memo = (snap as { [MEMO]?: unknown[] })[MEMO] ?? attachMemo(snap);
+    const memo = snapClass.memo(snap) ?? snapClass.memoInit(snap);
     memo[index] = value;
   };
 
   const readDerived = (index: number, snap: Full): unknown => {
     // Whatever this snapshot has already resolved is final — snapshots are
     // immutable, so a value it produced once is the value it produces forever.
-    const memo = (snap as { [MEMO]?: unknown[] })[MEMO];
-    if (memo !== undefined) {
+    const memo = snapClass.memo(snap);
+    if (memo !== null) {
       const cached = memo[index];
       if (cached !== EMPTY) return cached;
     }
@@ -550,25 +569,16 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
   };
 
-  // Per-store intermediate prototype: carries this store's readDerived under
-  // the module symbol, one hop below the shared getter prototype. Costs a
-  // fresh snapshot shape tree per store (~1µs at creation), which buys every
-  // write out of the old per-snapshot defineProperty — a trade that pays for
-  // itself within ~a dozen writes.
-  let derivedProto: object | null = null;
-  if (hasDerived) {
-    derivedProto = Object.create(protoFor(derivedKeys));
-    (derivedProto as WithRead)[READ_DERIVED] = readDerived as ReadDerived;
-  }
-
   // The snapshot is the single source of truth — there is no separate raw
-  // copy. Each accepted write builds the next snapshot in one pass; only
-  // `rawKeys` are carried over, so pinned derived own-properties never leak
-  // into the next snapshot.
+  // copy. Each accepted write builds the next snapshot in one pass, carrying
+  // only `rawKeys` over. A snapshot with derived values is an instance of the
+  // shared class, constructed with this store's readDerived; a state-only store
+  // never touches the class machinery and keeps plain object literals, which
+  // clone through V8's fast object-spread path.
   let snapshot = (
-    derivedProto === null
-      ? { ...config.state }
-      : Object.assign(Object.create(derivedProto), config.state)
+    hasDerived
+      ? Object.assign(new snapClass(readDerived as ReadDerived), config.state)
+      : { ...config.state }
   ) as Full;
   let destroyed = false;
 
@@ -604,7 +614,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     // batch): listeners are already cleared, but plugins must not hear
     // afterSetState after their onDestroy ran.
     if (destroyed) return;
-    if (notifyDepth > 0 && isDev) {
+    if (notifyDepth > 0 && DEV) {
       console.warn(
         "stoic: re-entrant setState detected — a plugin or subscriber updated state while a " +
           "notification was in progress. Prefer derived state or batching over update loops.",
@@ -656,7 +666,7 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const setState: SetState<T, Full> = (partial) => {
     if (destroyed) {
-      if (isDev) console.warn("stoic: setState called on a destroyed store; ignored");
+      if (DEV) console.warn("stoic: setState called on a destroyed store; ignored");
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
@@ -677,7 +687,7 @@ export function createStore<T extends object, D extends object = Record<never, n
         // Derived keys were never writable; unknown keys are rejected because
         // the state shape is fixed at creation (keeps every snapshot on one
         // hidden class and the derived dep records exhaustive).
-        if (isDev) {
+        if (DEV) {
           console.warn(
             derivedKeys.indexOf(key) !== -1
               ? `stoic: setState ignored derived key "${key}"; derived values are computed`
@@ -689,16 +699,20 @@ export function createStore<T extends object, D extends object = Record<never, n
       const value = (next as Record<string, unknown>)[key];
       if (!Object.is(snap[key], value)) {
         if (nextSnap === null) {
-          if (derivedProto === null) {
-            nextSnap = { ...snap };
-          } else {
-            // Copy only rawKeys (never pins), reading from the old snapshot.
-            nextSnap = Object.create(derivedProto) as Record<string, unknown>;
-            for (let i = 0; i < rawKeys.length; i++) {
-              const k = rawKeys[i] as string;
-              nextSnap[k] = snap[k];
-            }
-          }
+          // The previous snapshot's own enumerable properties are exactly the
+          // raw state keys — the resolved derived values live in a private
+          // field, so nothing has to be filtered out on the way across.
+          //
+          // `Object.assign` rather than a `rawKeys` loop of keyed stores: the
+          // loop measured the same on a three-key state and 28 ns worse on an
+          // eight-key one, because every keyed store pays its own transition
+          // lookup while assign walks the source map once.
+          nextSnap = hasDerived
+            ? (Object.assign(new snapClass(readDerived as ReadDerived), snap) as Record<
+                string,
+                unknown
+              >)
+            : { ...snap };
         }
         nextSnap[key] = value;
       }
@@ -734,7 +748,7 @@ export function createStore<T extends object, D extends object = Record<never, n
 
   const subscribe = (listener: Listener<Full>) => {
     if (destroyed) {
-      if (isDev) console.warn("stoic: subscribe called on a destroyed store; ignored");
+      if (DEV) console.warn("stoic: subscribe called on a destroyed store; ignored");
       return NOOP;
     }
     subs.push(listener);
@@ -928,7 +942,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
     const result: Record<string, unknown> = {};
     for (const [name, fn] of Object.entries(map)) {
-      if (isDev) {
+      if (DEV) {
         registeredActionNames ??= new Set();
         if (registeredActionNames.has(name)) {
           console.warn(
@@ -975,7 +989,9 @@ export function createStore<T extends object, D extends object = Record<never, n
     [DERIVED_KEYS]: derivedKeys,
   } as StoicStore<T, Full>;
 
-  for (const p of config.plugins ?? []) p.onInit?.(store);
+  for (let i = 0; plugins !== undefined && i < plugins.length; i++) {
+    (plugins[i] as StoicPlugin<T, Full>).onInit?.(store);
+  }
 
   return store;
 }

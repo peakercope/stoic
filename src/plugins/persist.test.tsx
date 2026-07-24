@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { refreshDevEnvForTests } from "../env";
 import { createStore } from "../stoic";
 import { type PersistDriver, persist, webStorage } from "./persist";
 
@@ -702,6 +703,7 @@ describe("persist", () => {
   describe("unavailable storage in production", () => {
     it("stays silent about unavailable storage in production builds", () => {
       vi.stubEnv("NODE_ENV", "production");
+      refreshDevEnvForTests();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
       const store = createStore({

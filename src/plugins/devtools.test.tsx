@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { refreshDevEnvForTests } from "../env";
 import { createStore } from "../stoic";
 import { devtools } from "./devtools";
 import { persist } from "./persist";
@@ -373,6 +374,7 @@ describe("devtools", () => {
 
   it("does not connect by default in production builds, even with the extension present", () => {
     vi.stubEnv("NODE_ENV", "production");
+    refreshDevEnvForTests();
     const extension = installFakeExtension();
 
     const store = createStore({
@@ -389,6 +391,7 @@ describe("devtools", () => {
 
   it("still connects in production when enabled is passed explicitly", () => {
     vi.stubEnv("NODE_ENV", "production");
+    refreshDevEnvForTests();
     const extension = installFakeExtension();
 
     const store = createStore({
