@@ -659,7 +659,18 @@ describe("circular dependency detection", () => {
       derived: { a: (s) => s.a + 1 },
     });
 
-    expect(() => getState().a).toThrow(new CircularDependencyError(["a", "a"]));
+    expect(() => getState().a).toThrow(CircularDependencyError);
+    expect(() => getState().a).toThrow("a → a");
+  });
+
+  it("names enumeration as the likely cause when a derived key reads itself", () => {
+    const { getState } = createStore<{ n: number }, { all: number }>({
+      state: { n: 1 },
+      // Spreading the state reads every key — including `all`, mid-compute.
+      derived: { all: (s) => Object.keys({ ...s }).length },
+    });
+
+    expect(() => getState().all).toThrow(/accidental enumeration/);
   });
 
   it("creating a store with a cyclic config does not throw on its own", () => {
@@ -1242,6 +1253,26 @@ describe("plugins", () => {
 
     store.setState({ count: 1 });
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("tolerates an unsubscribe held across destroy()", () => {
+    const store = createStore({ state: { count: 0 } });
+    const a = vi.fn();
+    const b = vi.fn();
+    const offA = store.subscribe(a);
+    store.subscribe(b);
+
+    store.destroy();
+    // destroy() already retired every slot and zeroed the live count, so these
+    // find nothing to remove. Guards the internal invariant that the live count
+    // never goes negative — which has no externally visible symptom today, so
+    // what this pins is the surrounding contract: no throw, no revived listener.
+    offA();
+    offA();
+
+    store.setState({ count: 1 });
+    expect(a).not.toHaveBeenCalled();
+    expect(b).not.toHaveBeenCalled();
   });
 });
 
@@ -2371,6 +2402,34 @@ describe("action abort signal", () => {
 
     for (const release of gates) release();
     await Promise.all([first, second, third]);
+  });
+
+  it("hands an already-aborted signal to a call that first reads it after settling", () => {
+    const store = createStore({ state: { value: "" } });
+    let first!: { signal: AbortSignal };
+    const { load } = store.actions({
+      load: (ctx) => {
+        first = ctx;
+      },
+    });
+
+    load(); // settles synchronously, never having read ctx.signal
+
+    // Reading the signal afterwards must not resurrect the finished call. It is
+    // stale by the abort contract, and registering it as in-flight here would
+    // leak: settle() has already run and is what would have removed it.
+    expect(first.signal.aborted).toBe(true);
+
+    // A call still running reads a live signal, settled or not — the guard is
+    // about having finished, not about being the latest call.
+    let live!: AbortSignal;
+    const { next } = store.actions({
+      next: (ctx) => {
+        live = ctx.signal;
+      },
+    });
+    next();
+    expect(live.aborted).toBe(false);
   });
 
   it("hands an already-aborted signal to an action called after destroy()", () => {

@@ -13,8 +13,8 @@ type DerivedConfig<T, D> = {
  * dependency chain.
  */
 export class CircularDependencyError extends Error {
-  constructor(cycle: string[]) {
-    super(`Circular dependency detected:\n${cycle.join(" → ")}`);
+  constructor(cycle: string[], hint = "") {
+    super(`Circular dependency detected:\n${cycle.join(" → ")}${hint}`);
     this.name = "CircularDependencyError";
   }
 }
@@ -297,7 +297,19 @@ const cycleError = (
   }
   chain.reverse();
   chain.push(keys[index] as string);
-  return new CircularDependencyError(chain);
+  // A key that reads *itself* is almost never a deliberate self-reference: it is
+  // a derived function that enumerates the whole state object, which walks the
+  // in-flight key's own getter along with everything else. A bare "sum → sum"
+  // chain gives no hint of that, so name the cause. DEV-gated because the
+  // message is the only part that is dev-only — detection has to ship.
+  return new CircularDependencyError(
+    chain,
+    DEV && innermost === index
+      ? `\n\n"${keys[index]}" reads its own value. This is often an accidental enumeration: ` +
+          "`{...state}`, `Object.keys(state)` and `Object.values(state)` all read every key, " +
+          "including the one being computed."
+      : "",
+  );
 };
 
 /**
@@ -389,14 +401,14 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
   }
 
-  // Subscribers in dispatch order, with unsubscribed slots held as null until
-  // it is safe to compact them away. Dispatching from an array rather than a
-  // Set drops the iterator allocation every notification paid and makes each
-  // step a single element load, which is what dominates once a real tree has a
-  // few dozen subscribers. Unsubscribing stays immediate — a listener removed
-  // mid-notification is skipped by the null check — at the cost of an indexOf
-  // scan per unsubscribe, which happens orders of magnitude less often than
-  // dispatch does.
+  // Subscribers in dispatch order, with unsubscribed slots retired to NOOP
+  // until it is safe to compact them away. Dispatching from an array rather
+  // than a Set drops the iterator allocation every notification paid and makes
+  // each step a single element load, which is what dominates once a real tree
+  // has a few dozen subscribers. Unsubscribing stays immediate — a listener
+  // removed mid-notification has already been replaced by NOOP, so the dispatch
+  // loop calls that instead — at the cost of an indexOf scan per unsubscribe,
+  // which happens orders of magnitude less often than dispatch does.
   const subs: Listener<Full>[] = [];
   let liveSubs = 0;
   // Cleared slots are compacted away only between notifications, never while a
@@ -640,14 +652,12 @@ export function createStore<T extends object, D extends object = Record<never, n
           if (snapshot !== seen) return;
         }
       }
-      // Iterating a cached array rather than the Set avoids allocating a Set
-      // iterator per notification, and it fixes the dispatch list for the
-      // duration of this pass: a listener subscribed by another listener
-      // belongs to the next change, not this one. Removal still takes effect
-      // immediately — a component unmounting mid-notification must not be
-      // called — so each entry is re-checked against the live Set.
-      // The length is read once: a listener subscribed by another listener
-      // belongs to the next change, not to this one.
+      // The length is read once, which fixes the dispatch list for the duration
+      // of this pass: a listener subscribed by another listener belongs to the
+      // next change, not to this one. Removal still takes effect immediately —
+      // a component unmounting mid-notification must not be called — because
+      // unsubscribe retires the slot to NOOP, which this loop then calls
+      // instead. Slots are only compacted away once no dispatch is walking.
       dispatchDepth++;
       try {
         const n = subs.length;
@@ -670,10 +680,12 @@ export function createStore<T extends object, D extends object = Record<never, n
       return;
     }
     const next = typeof partial === "function" ? partial(snapshot) : partial;
-    // Writing the current snapshot back is a no-op by definition, and the
-    // `for…in` below would otherwise walk the snapshot's prototype chain and
-    // evaluate every derived getter on it just to reject each one. An *older*
-    // snapshot is not a no-op and deliberately still goes the long way.
+    // Writing the current snapshot back is a no-op by definition. Skipping it
+    // here also avoids the `for…in` below walking the snapshot's prototype
+    // chain, where the derived getters are enumerable: `for…in` does not invoke
+    // them, but every one still costs a membership check and, in dev, a
+    // spurious "ignored derived key" warning. An *older* snapshot is not a
+    // no-op and deliberately still goes the long way.
     if ((next as unknown) === snapshot) return;
 
     const snap = snapshot as Record<string, unknown>;
@@ -758,7 +770,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       if (removed) return;
       removed = true;
       const at = subs.indexOf(listener);
-      if (at !== -1) subs[at] = NOOP;
+      // Missing once destroy() has retired every slot. `liveSubs` is already 0
+      // there, so decrementing would drive it negative — and there is nothing
+      // left to clear or compact either way.
+      if (at === -1) return;
+      subs[at] = NOOP;
       liveSubs--;
       compact();
     };
@@ -799,6 +815,9 @@ export function createStore<T extends object, D extends object = Record<never, n
       args: unknown[];
       // Lazy: allocated only when the action reads `ctx.signal`.
       controller: AbortController | null = null;
+      // Set by settle(). A call that has already finished must not be able to
+      // claim the abort slot or register a controller nothing will remove.
+      settled = false;
 
       constructor(callId: number, args: unknown[]) {
         this.callId = callId;
@@ -829,15 +848,17 @@ export function createStore<T extends object, D extends object = Record<never, n
         if (controller === null) {
           controller = new AbortController();
           this.controller = controller;
-          if (this.callId === latestCall && !destroyed) {
+          if (this.callId === latestCall && !destroyed && !this.settled) {
             currentController = controller;
             activeControllers ??= new Set();
             activeControllers.add(controller);
           } else {
-            // A newer call has already started (or the store is gone), so
-            // this call is stale by the abort contract: its signal is born
-            // aborted, and it must not take the abort slot from the newest
-            // in-flight call.
+            // A newer call has already started, the store is gone, or this call
+            // has already settled — all stale by the abort contract: the signal
+            // is born aborted, and it must not take the abort slot from the
+            // newest in-flight call. Without the `settled` check a signal read
+            // after the fact would register a controller that settle() has
+            // already run past and so can never remove.
             controller.abort();
           }
         }
@@ -847,6 +868,7 @@ export function createStore<T extends object, D extends object = Record<never, n
       // A prototype method, not a per-call closure: everything per-call it
       // needs lives on `this`, the rest comes from the runner's scope.
       settle(outcome: ActionMeta) {
+        this.settled = true;
         const controller = this.controller;
         if (controller !== null && currentController === controller) {
           activeControllers?.delete(controller);
