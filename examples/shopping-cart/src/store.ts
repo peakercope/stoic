@@ -1,5 +1,5 @@
 import { createStore } from "stoic-store";
-import { persist } from "stoic-store/plugins";
+import { devtools, persist } from "stoic-store/plugins";
 import type { Coupon, Product } from "./data";
 
 export type CartItem = {
@@ -75,7 +75,7 @@ export const cart = createStore<CartState, CartDerived>({
       discountedSubtotal + shippingCost + taxAmount,
   },
 
-  plugins: [persist<CartState>({ sync: true, key: "stoic-cart", debounceMs: 200 })],
+  plugins: [persist<CartState>({ sync: true, key: "stoic-cart", debounceMs: 200 }), devtools()],
 });
 
 export const { addItem, removeItem, setQuantity, applyCoupon, removeCoupon, setShippingMethod } =

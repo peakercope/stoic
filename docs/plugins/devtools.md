@@ -18,6 +18,10 @@ const cart = createStore({
 
 ## What you see
 
+<p align="left">
+  <img src="../../docs/assets/devtools.png" width="480" alt="devtools">
+</p>
+
 Every entry in the DevTools log is tagged with the name of the action that produced it (`setTax`, `addItem`, ...) and carries the arguments that action was called with, under `args`:
 
 ```jsonc
