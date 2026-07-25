@@ -1,5 +1,5 @@
 import type {} from "@redux-devtools/extension";
-import { isDevEnv } from "../env";
+import { DEV } from "../env";
 import { derivedKeysOf, type StoicPlugin, type StoicStore } from "../stoic";
 
 export interface DevtoolsOptions {
@@ -48,7 +48,7 @@ export function devtools<T extends object, Full extends object = T>(
   const anonymousActionType = options.anonymousActionType ?? "anonymous";
   const name = options.name ?? `stoic-store-#${++anonymousStoreCount}`;
 
-  const enabled = options.enabled ?? isDevEnv();
+  const enabled = options.enabled ?? DEV;
 
   let store: StoicStore<T, Full> | undefined;
   let connection: Connection | undefined;

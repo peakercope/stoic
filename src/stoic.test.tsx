@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import { refreshDevEnvForTests } from "../src/env";
 import { CircularDependencyError, createStore, type StoicPlugin } from "../src/stoic";
 import { useActionMeta, useStore } from "./react";
 import { shallow } from "./tools/shallow";
@@ -263,14 +264,14 @@ describe("derived", () => {
       derived: { doubled },
     });
 
-    // A fresh snapshot exposes the derived key as an enumerable getter on its
-    // prototype chain (per-store proto → shared getter proto); inspecting it
-    // computes nothing and the snapshot has no own property for it.
+    // A fresh snapshot exposes the derived key as an enumerable getter on the
+    // shared snapshot class's prototype; inspecting it computes nothing and the
+    // snapshot has no own property for it.
     setState({ count: 4 });
     const snapshot = getState();
     doubled.mockClear();
     expect(Object.getOwnPropertyDescriptor(snapshot, "doubled")).toBeUndefined();
-    const proto = Object.getPrototypeOf(Object.getPrototypeOf(snapshot) as object) as object;
+    const proto = Object.getPrototypeOf(snapshot) as object;
     const descriptor = Object.getOwnPropertyDescriptor(proto, "doubled");
     expect(descriptor?.get).toBeTypeOf("function");
     expect(descriptor?.enumerable).toBe(true);
@@ -301,6 +302,54 @@ describe("derived", () => {
     expect({ ...snapshot }).toEqual({ count: 4, name: "a" });
     expect(JSON.parse(JSON.stringify(snapshot))).toEqual({ count: 4, name: "a" });
     expect(snapshot).toEqual({ count: 4, name: "a" });
+    // The engine's per-snapshot slots are private class fields, so a snapshot
+    // carries no own symbol at all — an own *enumerable* symbol would be copied
+    // by the spread above and compared by `toEqual`.
+    expect(Object.getOwnPropertySymbols(snapshot)).toEqual([]);
+  });
+
+  it("keeps every snapshot's surface to the raw state keys across writes", () => {
+    const store = createStore<{ count: number; name: string }, { doubled: number; tag: string }>({
+      state: { count: 1, name: "a" },
+      derived: { doubled: (s) => s.count * 2, tag: (s) => `${s.name}:${s.doubled}` },
+    });
+
+    for (let i = 0; i < 3; i++) {
+      store.setState({ count: i });
+      const snapshot = store.getState();
+      // Read both derived values first: resolving them must not add own
+      // properties, and the next snapshot must not inherit the resolved ones.
+      expect(snapshot.doubled).toBe(i * 2);
+      expect(snapshot.tag).toBe(`a:${i * 2}`);
+
+      expect(Object.keys(snapshot)).toEqual(["count", "name"]);
+      expect(Object.getOwnPropertySymbols(snapshot)).toEqual([]);
+      expect(snapshot).toEqual({ count: i, name: "a" });
+      expect(JSON.stringify(snapshot)).toBe(`{"count":${i},"name":"a"}`);
+      expect(Object.getOwnPropertyDescriptor(snapshot, "doubled")).toBeUndefined();
+    }
+  });
+
+  it("gives stores that declare the same derived keys the same snapshot prototype", () => {
+    // The class is cached per derived-key-name set — that sharing is what keeps
+    // store creation off V8's fresh-prototype path. Two stores must still keep
+    // completely independent derived values.
+    const a = createStore<{ n: number }, { double: number }>({
+      state: { n: 1 },
+      derived: { double: (s) => s.n * 2 },
+    });
+    const b = createStore<{ n: number }, { double: number }>({
+      state: { n: 10 },
+      derived: { double: (s) => s.n * 3 },
+    });
+
+    expect(Object.getPrototypeOf(a.getState())).toBe(Object.getPrototypeOf(b.getState()));
+    expect(a.getState().double).toBe(2);
+    expect(b.getState().double).toBe(30);
+
+    a.setState({ n: 5 });
+    expect(a.getState().double).toBe(10);
+    expect(b.getState().double).toBe(30);
   });
 
   it("tracks non-string (symbol) property reads on the proxied state without adding them as dependencies", () => {
@@ -642,6 +691,7 @@ describe("circular dependency detection", () => {
 
   it("behaves the same in production builds", () => {
     vi.stubEnv("NODE_ENV", "production");
+    refreshDevEnvForTests();
     try {
       const store = createStore<{ a: number }, { b: number; c: number }>({
         state: { a: 1 },

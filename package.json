@@ -22,12 +22,36 @@
     "url": "https://github.com/peakercope/stoic/issues"
   },
   "exports": {
-    ".": "./dist/index.js",
-    "./plugins": "./dist/plugins.js",
-    "./plugins/devtools": "./dist/plugins/devtools.js",
-    "./plugins/persist": "./dist/plugins/persist.js",
-    "./react": "./dist/react.js",
-    "./tools": "./dist/tools.js",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "production": "./dist/prod/index.js",
+      "default": "./dist/index.js"
+    },
+    "./plugins": {
+      "types": "./dist/plugins.d.ts",
+      "production": "./dist/prod/plugins.js",
+      "default": "./dist/plugins.js"
+    },
+    "./plugins/devtools": {
+      "types": "./dist/plugins/devtools.d.ts",
+      "production": "./dist/prod/plugins/devtools.js",
+      "default": "./dist/plugins/devtools.js"
+    },
+    "./plugins/persist": {
+      "types": "./dist/plugins/persist.d.ts",
+      "production": "./dist/prod/plugins/persist.js",
+      "default": "./dist/plugins/persist.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "production": "./dist/prod/react.js",
+      "default": "./dist/react.js"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.ts",
+      "production": "./dist/prod/tools.js",
+      "default": "./dist/tools.js"
+    },
     "./package.json": "./package.json"
   },
   "types": "./dist/index.d.ts",
