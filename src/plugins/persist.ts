@@ -69,21 +69,21 @@ function settle<V>(run: () => MaybePromise<V>, ok: (value: V) => void, fail: () 
 // dependencies happen to be unchanged).
 function filterKeys<T extends object>(
   state: T,
-  options: { include?: (keyof T)[]; exclude?: (keyof T)[] },
+  include: (keyof T)[] | undefined,
+  excluded: ReadonlySet<keyof T>,
   derivedKeys: ReadonlySet<string>,
 ): Partial<T> {
   const result: Partial<T> = {};
 
-  if (options.include) {
+  if (include) {
     // A key can be absent when rehydrating an older payload that predates it;
     // copying it anyway would overwrite the initial-state default with undefined.
-    for (const key of options.include) {
+    for (const key of include) {
       if (key in state) result[key] = state[key];
     }
     return result;
   }
 
-  const excluded = new Set(options.exclude ?? []);
   for (const key of Object.keys(state) as (keyof T)[]) {
     if (excluded.has(key)) continue;
     if (derivedKeys.has(key as string)) continue;
@@ -171,6 +171,9 @@ export function persist<T extends object>(options: {
   const doSerialize = options.serialize ?? JSON.stringify;
   const doDeserialize = options.deserialize ?? (JSON.parse as (raw: string) => Partial<T>);
 
+  // Built once — filterKeys runs on every persisted write.
+  const excluded: ReadonlySet<keyof T> = new Set(options.exclude ?? []);
+
   // Populated in onInit, before any read or write can happen.
   let derivedKeys: ReadonlySet<string> = new Set();
 
@@ -197,7 +200,7 @@ export function persist<T extends object>(options: {
   };
 
   const encode = (state: T): string => {
-    const filtered = filterKeys(state, options, derivedKeys);
+    const filtered = filterKeys(state, options.include, excluded, derivedKeys);
     if (options.version === undefined) return doSerialize(filtered);
     // A custom serializer produces an opaque string, so it stays embedded.
     if (options.serialize) {
@@ -305,7 +308,7 @@ export function persist<T extends object>(options: {
       const payload = readPayload(raw);
       if (payload === undefined) return;
 
-      const parsed = filterKeys(payload as T, options, derivedKeys);
+      const parsed = filterKeys(payload as T, options.include, excluded, derivedKeys);
       // Drop keys the store no longer has: a stale payload would otherwise
       // merge them into state and re-persist them forever.
       const current = store.getState();

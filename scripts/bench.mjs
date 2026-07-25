@@ -67,8 +67,9 @@ const CASES = {
     },
   },
   // Distinct config object per store — what every `createStoreContext` factory
-  // and every per-request SSR store actually does. PROTO_CACHE is keyed on
-  // config identity today, so this never hits it.
+  // and every per-request SSR store actually does. The snapshot-class cache is
+  // keyed on derived key names, so this still hits it; the case pins the cost
+  // of the per-call config and derived-fn allocations on top of that.
   "create:derived-inline": {
     iters: 3e5,
     setup: (createStore) => () => {
