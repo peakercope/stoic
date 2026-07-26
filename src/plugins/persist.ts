@@ -59,8 +59,19 @@ function settle<V>(run: () => MaybePromise<V>, ok: (value: V) => void, fail: () 
     fail();
     return;
   }
-  if (result instanceof Promise) result.then(ok, fail);
-  else ok(result);
+  // Duck-typed rather than `instanceof Promise`: a driver may hand back a
+  // non-native thenable (a polyfilled promise), and treating it as a sync
+  // value would pass the thenable itself to `ok`. `Promise.resolve`
+  // assimilates it and returns a native promise unchanged.
+  if (
+    result !== null &&
+    typeof result === "object" &&
+    typeof (result as PromiseLike<V>).then === "function"
+  ) {
+    Promise.resolve(result).then(ok, fail);
+  } else {
+    ok(result as V);
+  }
 }
 
 // Derived values are always recomputed from raw state, so they are dropped on

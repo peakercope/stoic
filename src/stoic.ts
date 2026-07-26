@@ -515,6 +515,12 @@ export function createStore<T extends object, D extends object = Record<never, n
     // as readily as a recompute can — a derived dep is revalidated through its
     // own getter — so guarding only the recompute would let a cycle discovered
     // during revalidation run away.
+    //
+    // (A guard-free fresh path for cells whose record holds only raw keys was
+    // measured and rejected: it bought ~7% on the eight-cells-one-changed
+    // fan-out shape but cost 3–9% on recompute-heavy paths and ~20% on store
+    // creation — the per-snapshot memo write, which the identity guarantee
+    // requires, is the real floor, and it stays either way.)
     if (computeParent[index] !== IDLE) {
       throw cycleError(derivedKeys, computeParent, computingNow, index);
     }
@@ -522,8 +528,11 @@ export function createStore<T extends object, D extends object = Record<never, n
     const outer = computingNow;
     computingNow = index;
     try {
-      const deps = dDeps[index];
-      if (deps !== null && deps !== undefined) {
+      // The cast narrows away `undefined`: every cell's slot is pushed at
+      // creation, so an out-of-bounds read cannot happen and the extra
+      // runtime check the checker would otherwise force is pure dead code.
+      const deps = dDeps[index] as unknown[] | null;
+      if (deps !== null) {
         // A recorded compute is reusable for any snapshot on which every dep it
         // read still has the same value — derived functions are pure, so that
         // is exactly the condition for the cached value to be correct here.
@@ -647,8 +656,14 @@ export function createStore<T extends object, D extends object = Record<never, n
       // object for every accepted write.
       const seen = snapshot;
       if (afterSetStateHooks !== null) {
-        for (const p of afterSetStateHooks) {
-          p.afterSetState?.(snapshot, actionName, actionArgs);
+        // Indexed rather than for…of: this loop runs on every notification a
+        // plugin-bearing store makes, and the iterator is an allocation.
+        for (let i = 0; i < afterSetStateHooks.length; i++) {
+          (afterSetStateHooks[i] as StoicPlugin<T, Full>).afterSetState?.(
+            snapshot,
+            actionName,
+            actionArgs,
+          );
           if (snapshot !== seen) return;
         }
       }
@@ -699,7 +714,12 @@ export function createStore<T extends object, D extends object = Record<never, n
         // Derived keys were never writable; unknown keys are rejected because
         // the state shape is fixed at creation (keeps every snapshot on one
         // hidden class and the derived dep records exhaustive).
-        if (DEV) {
+        //
+        // Own-key gate on the warning: passing an *older snapshot* is a legal
+        // way to restore previous state, and `for…in` walks its prototype's
+        // enumerable derived getters — keys the caller never wrote, so they
+        // must not warn.
+        if (DEV && Object.hasOwn(next, key)) {
           console.warn(
             derivedKeys.indexOf(key) !== -1
               ? `stoic: setState ignored derived key "${key}"; derived values are computed`
@@ -878,7 +898,9 @@ export function createStore<T extends object, D extends object = Record<never, n
         // observed again. Meta still settles — handles outlive the store.
         if (afterActionHooks !== null && !destroyed) {
           const event: ActionEvent<Full> = { name, args: this.args, state: snapshot };
-          for (const p of afterActionHooks) p.afterAction?.(event);
+          for (let i = 0; i < afterActionHooks.length; i++) {
+            (afterActionHooks[i] as StoicPlugin<T, Full>).afterAction?.(event);
+          }
         }
         setMeta(this.callId, outcome);
       }
@@ -900,7 +922,9 @@ export function createStore<T extends object, D extends object = Record<never, n
       // Not after destroy: onDestroy already ran, mirroring afterAction below.
       if (beforeActionHooks !== null && !destroyed) {
         const event: ActionEvent<Full> = { name, args, state: snapshot };
-        for (const p of beforeActionHooks) p.beforeAction?.(event);
+        for (let i = 0; i < beforeActionHooks.length; i++) {
+          (beforeActionHooks[i] as StoicPlugin<T, Full>).beforeAction?.(event);
+        }
       }
 
       const callId = ++latestCall;
@@ -931,8 +955,17 @@ export function createStore<T extends object, D extends object = Record<never, n
         throw err;
       }
 
-      if (result instanceof Promise) {
-        return result.then(
+      // Non-native thenables (polyfilled promises, lazy thenables) must settle
+      // like promises, not like sync returns. `Promise.resolve` assimilates
+      // them — and returns a native promise unchanged, so the common async
+      // case pays only the failed `instanceof`.
+      if (
+        result instanceof Promise ||
+        (result !== null &&
+          typeof result === "object" &&
+          typeof (result as PromiseLike<unknown>).then === "function")
+      ) {
+        return Promise.resolve(result).then(
           (value) => {
             ctx.settle(SUCCESS_META);
             return value;
@@ -951,8 +984,12 @@ export function createStore<T extends object, D extends object = Record<never, n
     runner.subscribeMeta = (listener: (meta: ActionMeta) => void) => {
       metaListeners ??= new Set();
       const set = metaListeners;
-      set.add(listener);
-      return () => set.delete(listener);
+      // One wrapper per subscription: two subscriptions of the same function
+      // must not collapse into one Set entry, or unsubscribing either one
+      // would silence both.
+      const entry = (meta: ActionMeta) => listener(meta);
+      set.add(entry);
+      return () => set.delete(entry);
     };
 
     return runner;
@@ -963,7 +1000,8 @@ export function createStore<T extends object, D extends object = Record<never, n
   let registeredActionNames: Set<string> | null = null;
   const actions = ((map: Record<string, (...args: unknown[]) => unknown>) => {
     const result: Record<string, unknown> = {};
-    for (const [name, fn] of Object.entries(map)) {
+    for (const name of Object.keys(map)) {
+      const fn = map[name] as (...args: unknown[]) => unknown;
       if (DEV) {
         registeredActionNames ??= new Set();
         if (registeredActionNames.has(name)) {

@@ -834,6 +834,30 @@ describe("persist", () => {
       expect(warn).not.toHaveBeenCalled();
       warn.mockRestore();
     });
+
+    it("hydrates from a driver returning non-native thenables", async () => {
+      // Shaped like a polyfilled-promise storage (e.g. an old Bluebird-based
+      // adapter): thenable, but not `instanceof Promise`.
+      const thenableOf = <V,>(value: V) => ({
+        // biome-ignore lint/suspicious/noThenProperty: a non-native thenable is the point of this test
+        then: (onFulfilled?: (v: V) => unknown) => {
+          queueMicrotask(() => onFulfilled?.(value));
+        },
+      });
+      const driver: PersistDriver = {
+        getItem: () => thenableOf(JSON.stringify({ count: 42 })) as never,
+        setItem: () => thenableOf(undefined) as never,
+      };
+      const store = createStore({
+        state: { count: 0 },
+        plugins: [persist<{ count: number }>({ key: "thenable", driver })],
+      });
+
+      await vi.waitFor(() => {
+        expect(store.getState()).toEqual({ count: 42 });
+      });
+      store.destroy();
+    });
   });
 
   describe("onHydrate", () => {

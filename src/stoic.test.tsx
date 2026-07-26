@@ -2600,4 +2600,77 @@ describe("regressions", () => {
     unsubscribe();
     store.destroy();
   });
+
+  it("keeps a second subscribeMeta subscription of the same listener alive after the first unsubscribes", () => {
+    const store = createStore({ state: { n: 0 } });
+    const { inc } = store.actions({ inc: (ctx) => ctx.set({ n: ctx.get().n + 1 }) });
+    const listener = vi.fn();
+    const unsub1 = inc.subscribeMeta(listener);
+    const unsub2 = inc.subscribeMeta(listener);
+
+    unsub1();
+    inc();
+
+    // The remaining subscription hears pending + success.
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsub2();
+    listener.mockClear();
+    inc();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("restores an older snapshot via setState without warning about derived keys", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const store = createStore<{ count: number }, { double: number }>({
+        state: { count: 0 },
+        derived: { double: (s) => s.count * 2 },
+      });
+      const old = store.getState();
+      store.setState({ count: 1 });
+      store.setState(old);
+
+      expect(store.getState().count).toBe(0);
+      expect(store.getState().double).toBe(0);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("still warns when a caller writes a derived key as an own key", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const store = createStore<{ count: number }, { double: number }>({
+        state: { count: 0 },
+        derived: { double: (s) => s.count * 2 },
+      });
+      store.setState({ double: 99 } as never);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('ignored derived key "double"'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("treats a non-native thenable returned from an action like a promise", async () => {
+    const { actions } = createStore({ state: { n: 0 } });
+    let resolveIt!: (v: number) => void;
+    const thenable = {
+      // biome-ignore lint/suspicious/noThenProperty: a hand-rolled thenable is the point of this test
+      then(onFulfilled: (v: number) => void) {
+        resolveIt = onFulfilled;
+      },
+    };
+    const { load } = actions({ load: () => thenable });
+
+    const result = load();
+    expect(load.getMeta().status).toBe("pending");
+
+    // Promise.resolve assimilates thenables on a microtask, so `then` is not
+    // called synchronously.
+    await vi.waitFor(() => expect(resolveIt).toBeTypeOf("function"));
+    resolveIt(42);
+    await expect(result).resolves.toBe(42);
+    expect(load.getMeta().status).toBe("success");
+  });
 });
