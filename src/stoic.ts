@@ -143,22 +143,6 @@ export interface StoicPlugin<T extends object = object, Full extends object = T>
   onDestroy?(): void;
 }
 
-// Memoization state for the derived keys lives in parallel arrays indexed by a
-// dense derived-key index rather than in one object per key: the prototype
-// getter closes over its index, so a read is an element load instead of a
-// string-keyed lookup that goes megamorphic once several stores exist.
-//
-// `deps[i]` records (key, value-at-compute-time) pairs — flattened as
-// [k0, v0, k1, v1, …] — from the most recent compute. That compute is fresh
-// for a snapshot when every recorded dep value is still `Object.is`-equal on
-// it; reading a derived dep recurses through its own getter, so invalidation
-// is transitive. This state describes the live snapshot only — see readDerived.
-//
-// Resolved values are then memoized per snapshot (the `#memo` field on the
-// snapshot class), which is what makes a snapshot immutable in practice:
-// whatever value it produced for a derived key once is the value it produces
-// forever, however much the store has moved on since.
-
 // The internal contract between the core and the first-party plugins: the
 // store carries its derived key list under a module-private symbol. Plugins
 // can't inspect snapshot property descriptors instead — derived getters live
@@ -416,7 +400,11 @@ export function createStore<T extends object, D extends object = Record<never, n
   // Derived-only structures are never allocated for state-only stores; every
   // use is behind a hasDerived (or derived-read) path. Parallel arrays indexed
   // by derived-key index, so a read is an element load rather than a
-  // string-keyed lookup on a shared dictionary.
+  // string-keyed lookup that goes megamorphic once several stores exist.
+  //
+  // `dDeps[i]` holds the (key, value-at-compute-time) pairs the last compute
+  // read, flattened as [k0, v0, k1, v1, …], and describes the live snapshot
+  // only — resolved values are memoized per snapshot, see readDerived.
   //
   // The snapshot class is shared by every store declaring these derived keys,
   // so this is a cache lookup rather than a build.
@@ -425,11 +413,9 @@ export function createStore<T extends object, D extends object = Record<never, n
   const dDeps: (unknown[] | null)[] = hasDerived ? [] : (null as never);
   const dFns: ((s: Full) => unknown)[] = hasDerived ? [] : (null as never);
   // The cycle guard: one slot per cell, set for the duration of its compute.
-  // It used to hold the index of the compute that triggered this one, so a
-  // cycle could be described by walking the parent pointers — which cost the
-  // hot path a second slot (`computingNow`) plus its save and restore on every
-  // compute, to carry information only an error message ever read. That is now
-  // a dev-only stack, and detection is the same either way.
+  // Detection needs nothing more — describing the path into the cycle is an
+  // error-message concern only, so it is a dev-only stack rather than parent
+  // pointers the hot path would have to save and restore on every compute.
   const computing: number[] = hasDerived ? [] : (null as never);
   const computeStack: number[] = DEV && hasDerived ? [] : (null as never);
 
@@ -471,8 +457,8 @@ export function createStore<T extends object, D extends object = Record<never, n
   // call instead of a Proxy get trap on every read inside a derived fn.
   // Reads resolve against the snapshot, so a derived dep's getter memoizes
   // against the snapshot and its own transitive reads are not recorded as the
-  // outer cell's deps. Built lazily on the first recompute; the dev-only
-  // eager pass at creation triggers it there.
+  // outer cell's deps. Built lazily on the first recompute, so a store whose
+  // derived values are never read never builds one.
   let trackSnap: Record<string, unknown> = undefined as never;
   let trackDeps: unknown[] = undefined as never;
   let tracker: Full | null = null;
@@ -610,13 +596,10 @@ export function createStore<T extends object, D extends object = Record<never, n
   if (DEV) Object.freeze(snapshot);
   let destroyed = false;
 
-  // Derived values are lazy in development too. The eager pass that used to run
-  // here surfaced a statically cyclic config at creation rather than on first
-  // read, but it cost a full evaluation of every derived key per store and made
-  // dev and production disagree about when derived functions run — including
-  // how often, which made recompute assertions in user tests mode-dependent.
-  // A cycle still throws, with the same chain in the message, on the read that
-  // walks into it.
+  // Derived values stay lazy in development too: dev and production must agree
+  // on when — and how often — derived functions run, or recompute assertions in
+  // user tests turn mode-dependent. So a cyclic config surfaces on the read that
+  // walks into it, not at creation, with the same chain in the message.
 
   const getState = () => snapshot;
 
@@ -740,10 +723,6 @@ export function createStore<T extends object, D extends object = Record<never, n
       // that `rawKeys` doesn't know about: one hidden class per store and
       // exhaustive derived dep records both depend on that not happening.
       if (!Object.hasOwn(snap, key)) {
-        // Derived keys were never writable; unknown keys are rejected because
-        // the state shape is fixed at creation (keeps every snapshot on one
-        // hidden class and the derived dep records exhaustive).
-        //
         // Own-key gate on the warning: passing an *older snapshot* is a legal
         // way to restore previous state, and `for…in` walks its prototype's
         // enumerable derived getters — keys the caller never wrote, so they
@@ -970,11 +949,10 @@ export function createStore<T extends object, D extends object = Record<never, n
     // biome.json for the same reason.) Nothing here touches `this`, so the
     // handle stays safe to destructure off the actions object.
     const runner = function (): unknown {
-      // A rest parameter allocates an array on *every* call, and the only
-      // things that ever read it are the two action hooks and the attribution
-      // closure — none of which most stores have. `argsWanted` is constant per
-      // store, so this branch is perfectly predicted, and when it is false the
-      // arguments object never escapes and V8 elides it entirely.
+      // The only things that ever read the args are the two action hooks and
+      // the attribution closure — none of which most stores have. `argsWanted`
+      // is constant per store, so this branch is perfectly predicted, and when
+      // it is false the arguments object never escapes and V8 elides it.
       const argc = arguments.length;
       let args: unknown[] = NO_ARGS;
       if (argsWanted && argc !== 0) {
