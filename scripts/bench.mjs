@@ -188,6 +188,47 @@ const CASES = {
     },
   },
 
+  // Eight raw keys rather than three: the snapshot clone is the bulk of a
+  // derived store's write cost, and `Object.assign` versus a keyed loop only
+  // diverges once the source map is wide enough for the per-key transition
+  // lookups to show up.
+  "set:derived-8raw": {
+    iters: 1e6,
+    setup: (createStore) => {
+      const store = createStore({
+        state: fanoutState(),
+        derived: { d0: (s) => s.a0 * 2, d1: (s) => s.a1 * 2, d2: (s) => s.a0 + s.a1 },
+      });
+      store.subscribe(() => {});
+      let i = 0;
+      return () => {
+        store.setState({ a0: i++ });
+        return 0;
+      };
+    },
+  },
+
+  // ── subscription churn ──
+  // A route change unmounts a whole subtree at once, so unsubscribe arrives in
+  // bursts rather than one at a time. Nothing else in the suite measures it,
+  // which let an O(n) scan plus an O(n) compaction *per* unsubscribe go unseen.
+  "unsub:mass-unmount-256": {
+    iters: 2e3,
+    setup: (createStore) => {
+      const store = createStore({ state: state3() });
+      // Distinct functions, allocated once outside the timed loop: subscribing
+      // the *same* function 256 times would make an indexOf-based unsubscribe
+      // hit index 0 every time and hide exactly the cost this case exists for.
+      const listeners = Array.from({ length: 256 }, () => () => {});
+      const unsubs = new Array(256);
+      return () => {
+        for (let i = 0; i < 256; i++) unsubs[i] = store.subscribe(listeners[i]);
+        for (let i = 0; i < 256; i++) unsubs[i]();
+        return 0;
+      };
+    },
+  },
+
   // ── derived fan-out: write one raw key, read all eight derived ──
   "fanout:8derived-1changed": {
     iters: 5e5,

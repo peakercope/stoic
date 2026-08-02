@@ -30,6 +30,18 @@
       "enabled": true
     }
   },
+  "overrides": [
+    {
+      "includes": ["src/stoic.ts"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "noArguments": "off"
+          }
+        }
+      }
+    }
+  ],
   "assist": {
     "enabled": true,
     "actions": {

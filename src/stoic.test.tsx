@@ -700,7 +700,7 @@ describe("circular dependency detection", () => {
     expect(() => getState().a).toThrow(new CircularDependencyError(["a", "b", "a"]));
   });
 
-  it("behaves the same in production builds", () => {
+  it("still detects and names the key in production builds", () => {
     vi.stubEnv("NODE_ENV", "production");
     refreshDevEnvForTests();
     try {
@@ -708,7 +708,11 @@ describe("circular dependency detection", () => {
         state: { a: 1 },
         derived: { b: (s) => s.c, c: (s) => s.b },
       });
+      // Detection has to ship; describing the path into the cycle does not.
+      // Production names the key the read was caught on and stops there — the
+      // stack the full chain is built from is only maintained in development.
       expect(() => store.getState().b).toThrow(CircularDependencyError);
+      expect(() => store.getState().b).toThrow(/\bb\b/);
     } finally {
       vi.unstubAllEnvs();
     }
@@ -2672,5 +2676,162 @@ describe("regressions", () => {
     resolveIt(42);
     await expect(result).resolves.toBe(42);
     expect(load.getMeta().status).toBe("success");
+  });
+});
+
+describe("fixed state shape", () => {
+  it("does not widen the accepted key set when the config object is mutated after creation", () => {
+    const config = { count: 0 };
+    const store = createStore({ state: config });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      Object.assign(config, { extra: 1 });
+      store.setState({ extra: 5 } as Partial<typeof config>);
+
+      expect(Object.keys(store.getState())).toEqual(["count"]);
+      expect("extra" in store.getState()).toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('unknown key "extra"'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps every snapshot on the declared key set across writes", () => {
+    const config = { a: 1, b: 2 };
+    const store = createStore({ state: config });
+    Object.assign(config, { c: 3 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      store.setState({ a: 9, c: 3 } as Partial<typeof config>);
+      expect(store.getState()).toEqual({ a: 9, b: 2 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("frozen snapshots in dev", () => {
+  it("throws when state is mutated directly", () => {
+    const store = createStore({ state: { count: 0 } });
+    expect(() => {
+      (store.getState() as { count: number }).count = 5;
+    }).toThrow(TypeError);
+    expect(store.getState().count).toBe(0);
+  });
+
+  it("freezes snapshots minted by setState, and derived reads still work on them", () => {
+    const store = createStore<{ count: number }, { double: number }>({
+      state: { count: 1 },
+      derived: { double: (s) => s.count * 2 },
+    });
+    store.setState({ count: 3 });
+    const snap = store.getState();
+
+    expect(Object.isFrozen(snap)).toBe(true);
+    // The per-snapshot memo lives in a private field, which Object.freeze does
+    // not reach — reading a derived value must still memoize.
+    expect(snap.double).toBe(6);
+    expect(snap.double).toBe(6);
+  });
+});
+
+describe("setState updater that writes state", () => {
+  it("warns in dev and keeps the nested write for keys the partial does not touch", () => {
+    const store = createStore({ state: { a: 0, b: 0 } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      store.setState((s) => {
+        store.setState({ b: 99 });
+        return { a: s.a + 1 };
+      });
+
+      expect(store.getState()).toEqual({ a: 1, b: 99 });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("wrote state while it was running"),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not warn for a pure updater", () => {
+    const store = createStore({ state: { a: 0 } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      store.setState((s) => ({ a: s.a + 1 }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("subscription churn", () => {
+  it("keeps dispatch correct across an interleaved subscribe/unsubscribe burst", () => {
+    const store = createStore({ state: { n: 0 } });
+    const seen: number[] = [];
+    const unsubs = Array.from({ length: 64 }, (_, i) =>
+      store.subscribe(() => {
+        seen.push(i);
+      }),
+    );
+
+    // Retire every other slot, which drives the amortized compaction.
+    for (let i = 0; i < 64; i += 2) unsubs[i]?.();
+    store.setState({ n: 1 });
+
+    expect(seen).toEqual(Array.from({ length: 32 }, (_, k) => k * 2 + 1));
+
+    // The survivors' unsubscribes must still find their own slots after the
+    // array has been compacted underneath them.
+    seen.length = 0;
+    for (let i = 1; i < 64; i += 2) unsubs[i]?.();
+    store.setState({ n: 2 });
+    expect(seen).toEqual([]);
+  });
+
+  it("retires the right slot when a listener unsubscribes mid-dispatch", () => {
+    const store = createStore({ state: { n: 0 } });
+    const calls: string[] = [];
+    store.subscribe(() => calls.push("a"));
+    const off = store.subscribe(() => {
+      calls.push("b");
+      off();
+    });
+    store.subscribe(() => calls.push("c"));
+
+    store.setState({ n: 1 });
+    expect(calls).toEqual(["a", "b", "c"]);
+
+    calls.length = 0;
+    store.setState({ n: 2 });
+    expect(calls).toEqual(["a", "c"]);
+  });
+
+  it("tolerates unsubscribing twice, and unsubscribing after destroy()", () => {
+    const store = createStore({ state: { n: 0 } });
+    const off1 = store.subscribe(() => {});
+    const off2 = store.subscribe(() => {});
+    off1();
+    off1();
+    store.destroy();
+    expect(() => off2()).not.toThrow();
+  });
+
+  it("keeps both subscriptions of the same listener independent", () => {
+    const store = createStore({ state: { n: 0 } });
+    let calls = 0;
+    const listener = () => {
+      calls++;
+    };
+    const off1 = store.subscribe(listener);
+    store.subscribe(listener);
+
+    store.setState({ n: 1 });
+    expect(calls).toBe(2);
+
+    off1();
+    store.setState({ n: 2 });
+    expect(calls).toBe(3);
   });
 });
