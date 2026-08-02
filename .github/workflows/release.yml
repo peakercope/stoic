@@ -44,9 +44,11 @@ jobs:
         run: yarn test
 
       - name: Create release pull request or publish
-        uses: changesets/action@v1
+        uses: changesets/action@v1.9.0
         with:
           publish: yarn release
           version: yarn version-packages
+          commit: "chore: version packages"
+          title: "chore: version packages"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
