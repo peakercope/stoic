@@ -276,35 +276,31 @@ const NOOP = () => {};
 // Handed to every state-only store as its derived key list; never mutated.
 const NO_KEYS: string[] = [];
 
-// `computeParent` slot values: IDLE when a derived key is not being computed,
-// ROOT when its compute was started by a plain read rather than by another
-// derived value. Anything else is the index of the compute that triggered it.
-const IDLE = -2;
-const ROOT = -1;
+// Stands in for an action call's arguments when nothing can observe them (see
+// `argsWanted`). Never read in that case and never mutated.
+const NO_ARGS: unknown[] = [];
 
 // Cold path — module level so it is not a closure allocated per store, and so
 // the message-building code stays out of every store's context.
-const cycleError = (
-  keys: string[],
-  parent: number[],
-  innermost: number,
-  index: number,
-): CircularDependencyError => {
-  const chain: string[] = [];
-  for (let at = innermost; at !== ROOT; at = parent[at] as number) {
-    chain.push(keys[at] as string);
-    if (at === index) break;
-  }
-  chain.reverse();
+//
+// Detection has to ship, but describing the path into the cycle does not:
+// `stack` is only maintained in development, and production builds fold this
+// down to naming the key the read was caught on.
+const cycleError = (keys: string[], stack: number[], index: number): CircularDependencyError => {
+  if (!DEV) return new CircularDependencyError([keys[index] as string]);
+
+  // Everything from the cell's own in-flight compute down to the innermost one
+  // is the cycle; anything above it is just how the read got there.
+  const from = stack.indexOf(index);
+  const chain = stack.slice(from === -1 ? stack.length - 1 : from).map((at) => keys[at] as string);
   chain.push(keys[index] as string);
   // A key that reads *itself* is almost never a deliberate self-reference: it is
   // a derived function that enumerates the whole state object, which walks the
   // in-flight key's own getter along with everything else. A bare "sum → sum"
-  // chain gives no hint of that, so name the cause. DEV-gated because the
-  // message is the only part that is dev-only — detection has to ship.
+  // chain gives no hint of that, so name the cause.
   return new CircularDependencyError(
     chain,
-    DEV && innermost === index
+    stack[stack.length - 1] === index
       ? `\n\n"${keys[index]}" reads its own value. This is often an accidental enumeration: ` +
           "`{...state}`, `Object.keys(state)` and `Object.values(state)` all read every key, " +
           "including the one being computed."
@@ -313,8 +309,10 @@ const cycleError = (
 };
 
 /**
- * @internal Not part of the public API. Returns a copy — the store keeps using
- * its own list, so a plugin cannot reorder or truncate it.
+ * @internal Not part of the public API. Returns a copy, so the ordinary way of
+ * reading the list cannot reorder or truncate the store's own. This is a
+ * convenience for the first-party plugins, not a security boundary — the live
+ * array is still reachable through `Object.getOwnPropertySymbols(store)`.
  */
 export const derivedKeysOf = (store: object): readonly string[] => {
   const keys = (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS];
@@ -357,19 +355,7 @@ export function createStore<T extends object, D extends object = Record<never, n
   const derivedKeys = derivedFns === undefined ? NO_KEYS : Object.keys(derivedFns);
   const hasDerived = derivedKeys.length > 0;
   // The state shape is fixed at creation: setState only applies these keys.
-  // `initialState` doubles as the membership check (hasOwn beats a Set here —
-  // no extra allocation at creation, same lookup cost per written key).
-  const initialState = config.state as Record<string, unknown>;
   const rawKeys = Object.keys(config.state);
-  for (let i = 0; i < derivedKeys.length; i++) {
-    const key = derivedKeys[i] as string;
-    if (Object.hasOwn(config.state, key)) {
-      throw new Error(
-        `stoic: "${key}" is declared in both \`state\` and \`derived\`. The derived getter ` +
-          "would shadow the state key, making it unreachable and unwritable — rename one of them.",
-      );
-    }
-  }
   // Per-hook plugin lists, resolved once: the hot paths skip hook dispatch (and
   // the event-object allocation) entirely when no plugin implements a hook.
   // These lists are also the store's only reference to the plugins, so mutating
@@ -438,26 +424,43 @@ export function createStore<T extends object, D extends object = Record<never, n
   const dValue: unknown[] = hasDerived ? [] : (null as never);
   const dDeps: (unknown[] | null)[] = hasDerived ? [] : (null as never);
   const dFns: ((s: Full) => unknown)[] = hasDerived ? [] : (null as never);
-  // Doubles as the cycle guard and as the chain used to describe a cycle once
-  // one is found. One element load replaces the old per-cell `computing`
-  // boolean *and* the string stack that existed only for the error message.
-  const computeParent: number[] = hasDerived ? [] : (null as never);
-  let computingNow = ROOT;
+  // The cycle guard: one slot per cell, set for the duration of its compute.
+  // It used to hold the index of the compute that triggered this one, so a
+  // cycle could be described by walking the parent pointers — which cost the
+  // hot path a second slot (`computingNow`) plus its save and restore on every
+  // compute, to carry information only an error message ever read. That is now
+  // a dev-only stack, and detection is the same either way.
+  const computing: number[] = hasDerived ? [] : (null as never);
+  const computeStack: number[] = DEV && hasDerived ? [] : (null as never);
 
   // One pass, pushing into arrays that stay packed, rather than four
-  // `new Array(n).fill(…)` calls plus a `.map` closure.
+  // `new Array(n).fill(…)` calls plus a `.map` closure. The state/derived
+  // collision check rides along on the same walk of `derivedKeys`.
   //
   // Folding `dValue` into slot 0 of the deps record — one array fewer per store
   // and one slot fewer here — was measured and reverted: it bought 44 ns of
   // one-time store creation and cost 2.1 ns on every *repeat* read of an
   // already-memoized derived value (2.3 → 4.4 ns), which is the hottest read a
   // React tree makes.
+  //
+  // Refilling a cell's existing deps record in place on recompute, instead of
+  // allocating a replacement, was measured and reverted too: +26% on
+  // set:derived-read2 and +21% on set:derived-chain. Shrinking an array and
+  // re-growing it costs far more than a fresh one, which V8 bump-allocates in
+  // the nursery and collects there.
   const fns = derivedFns as Record<string, (s: Full) => unknown>;
   for (let i = 0; i < derivedKeys.length; i++) {
+    const key = derivedKeys[i] as string;
+    // A derived getter lives on the prototype, so a raw key of the same name
+    // would shadow it — unreachable and unwritable. Ships: silently losing a
+    // state key in production is worse than the bytes this costs.
+    if (Object.hasOwn(config.state, key)) {
+      throw new Error(`stoic: "${key}" is in both \`state\` and \`derived\`; rename one`);
+    }
     dValue.push(undefined);
     dDeps.push(null);
-    dFns.push(fns[derivedKeys[i] as string] as (s: Full) => unknown);
-    computeParent.push(IDLE);
+    dFns.push(fns[key] as (s: Full) => unknown);
+    computing.push(0);
   }
 
   // One tracker object per store, retargeted around each compute via these
@@ -521,12 +524,9 @@ export function createStore<T extends object, D extends object = Record<never, n
     // fan-out shape but cost 3–9% on recompute-heavy paths and ~20% on store
     // creation — the per-snapshot memo write, which the identity guarantee
     // requires, is the real floor, and it stays either way.)
-    if (computeParent[index] !== IDLE) {
-      throw cycleError(derivedKeys, computeParent, computingNow, index);
-    }
-    computeParent[index] = computingNow;
-    const outer = computingNow;
-    computingNow = index;
+    if (computing[index] !== 0) throw cycleError(derivedKeys, computeStack, index);
+    computing[index] = 1;
+    if (DEV) computeStack.push(index);
     try {
       // The cast narrows away `undefined`: every cell's slot is pushed at
       // creation, so an out-of-bounds read cannot happen and the extra
@@ -585,8 +585,8 @@ export function createStore<T extends object, D extends object = Record<never, n
       remember(snap, index, value);
       return value;
     } finally {
-      computeParent[index] = IDLE;
-      computingNow = outer;
+      computing[index] = 0;
+      if (DEV) computeStack.pop();
     }
   };
 
@@ -601,6 +601,13 @@ export function createStore<T extends object, D extends object = Record<never, n
       ? Object.assign(new snapClass(readDerived as ReadDerived), config.state)
       : { ...config.state }
   ) as Full;
+  // Snapshots are immutable by contract — the derived dep records compare
+  // against their values, and a retained older snapshot's memo is only sound
+  // while the values it was computed from stay put. Nothing enforced that, so
+  // a stray `getState().count = 1` corrupted both silently. Freezing in dev
+  // turns it into a TypeError at the write; the private-field memo is not a
+  // property, so it keeps working on a frozen snapshot.
+  if (DEV) Object.freeze(snapshot);
   let destroyed = false;
 
   // Derived values are lazy in development too. The eager pass that used to run
@@ -643,7 +650,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     if (notifyDepth >= MAX_NOTIFY_DEPTH) {
       throw new Error(
-        "stoic: maximum update depth exceeded. A plugin or subscriber calls setState on every state change, creating an infinite update loop.",
+        "stoic: maximum update depth exceeded — a plugin or subscriber writes state on every change",
       );
     }
     notifyDepth++;
@@ -694,7 +701,21 @@ export function createStore<T extends object, D extends object = Record<never, n
       if (DEV) console.warn("stoic: setState called on a destroyed store; ignored");
       return;
     }
-    const next = typeof partial === "function" ? partial(snapshot) : partial;
+    const base = snapshot;
+    const next = typeof partial === "function" ? partial(base) : partial;
+    // An updater that writes state — directly, or through an action it calls —
+    // leaves the partial it returned describing a state that no longer exists.
+    // The merge below still lands on the *current* snapshot, so the nested
+    // write survives except where the partial overlaps it; rebasing onto `base`
+    // instead would discard that write wholesale, which is worse. Neither is
+    // something to rely on, so say so rather than pick a silent winner.
+    if (DEV && snapshot !== base) {
+      console.warn(
+        "stoic: an updater passed to setState wrote state while it was running. The partial it " +
+          "returned was computed from the state before that write, so any key they share is " +
+          "about to be overwritten with a stale value. Updaters must be pure — move the write out.",
+      );
+    }
     // Writing the current snapshot back is a no-op by definition. Skipping it
     // here also avoids the `for…in` below walking the snapshot's prototype
     // chain, where the derived getters are enumerable: `for…in` does not invoke
@@ -705,12 +726,20 @@ export function createStore<T extends object, D extends object = Record<never, n
 
     const snap = snapshot as Record<string, unknown>;
     let nextSnap: Record<string, unknown> | null = null;
-    // No own-key guard on the partial: the membership check against
-    // `initialState` below already rejects anything that isn't a state key,
+    // No own-key guard on the partial: the membership check against the
+    // snapshot below already rejects anything that isn't a state key,
     // so inherited enumerable keys can't smuggle values in — they are either
     // state keys (applied, as an own read would be) or ignored.
     for (const key in next) {
-      if (!Object.hasOwn(initialState, key)) {
+      // Membership is checked against the live snapshot, not against
+      // `config.state`. Every snapshot's own enumerable keys are exactly the
+      // raw state keys — derived getters live on the prototype and the memo in
+      // a private field — so the two agree, but the snapshot is ours. Holding
+      // the caller's config object instead let them widen the accepted key set
+      // after the fact by mutating it, which put a key on the next snapshot
+      // that `rawKeys` doesn't know about: one hidden class per store and
+      // exhaustive derived dep records both depend on that not happening.
+      if (!Object.hasOwn(snap, key)) {
         // Derived keys were never writable; unknown keys are rejected because
         // the state shape is fixed at creation (keeps every snapshot on one
         // hidden class and the derived dep records exhaustive).
@@ -751,6 +780,7 @@ export function createStore<T extends object, D extends object = Record<never, n
     }
     if (nextSnap === null) return;
 
+    if (DEV) Object.freeze(nextSnap);
     snapshot = nextSnap as Full;
 
     if (batchDepth > 0) {
@@ -783,28 +813,48 @@ export function createStore<T extends object, D extends object = Record<never, n
       if (DEV) console.warn("stoic: subscribe called on a destroyed store; ignored");
       return NOOP;
     }
-    subs.push(listener);
+    // The slot this listener went into, kept as a search hint. Compaction only
+    // ever moves a listener *left* and only ever shortens the array, so this is
+    // a standing upper bound on the real index: scanning down from it costs one
+    // step per removal that landed ahead of us, which is O(1) in practice
+    // against the O(n) full scan an indexOf does.
+    const hint = subs.push(listener) - 1;
     liveSubs++;
     let removed = false;
     return () => {
       if (removed) return;
       removed = true;
-      const at = subs.indexOf(listener);
+      let at = hint < subs.length ? hint : subs.length - 1;
+      while (at >= 0 && subs[at] !== listener) at--;
       // Missing once destroy() has retired every slot. `liveSubs` is already 0
       // there, so decrementing would drive it negative — and there is nothing
       // left to clear or compact either way.
-      if (at === -1) return;
+      if (at < 0) return;
       subs[at] = NOOP;
       liveSubs--;
-      compact();
+      // Amortized: a route change unsubscribes a whole subtree in one go, and
+      // compacting on each of those made teardown O(n²) — an O(n) scan plus an
+      // O(n) copy per listener. Waiting for the dead slots to reach half the
+      // array bounds the copying at O(n) across the whole burst, and costs the
+      // dispatch loop at most one NOOP call per live listener in between.
+      if (subs.length - liveSubs > 8 && subs.length > liveSubs * 2) compact();
     };
   };
 
-  // Action attribution exists to tell afterSetState which action produced a
-  // write. With no such hook the whole mechanism is unobservable.
-  const attributed = afterSetStateHooks !== null;
-
   const createActionRunner = (name: string, fn: (...args: unknown[]) => unknown) => {
+    // Both of these are derived from hook lists that are already in scope, and
+    // both are read only from here — so they are computed per action rather
+    // than per store. A binding at `createStore` level would be one more slot
+    // in the context object every store allocates, and that context is small
+    // enough that one slot measured ~10 ns (17%) on `create:state-only`.
+    //
+    // Attribution exists to tell afterSetState which action produced a write;
+    // with no such hook the whole mechanism is unobservable. Arguments are
+    // observable through either action hook or through attribution, and with
+    // none of the three a call never has to materialize them at all.
+    const attributed = afterSetStateHooks !== null;
+    const argsWanted = attributed || beforeActionHooks !== null || afterActionHooks !== null;
+
     let meta: ActionMeta = IDLE_META;
     // Meta tracks the most recent invocation: a stale call settling later must
     // not overwrite the outcome of a newer one.
@@ -814,13 +864,15 @@ export function createStore<T extends object, D extends object = Record<never, n
     // call aborts it. Cleared on settle so a finished call is never aborted.
     let currentController: AbortController | null = null;
 
+    // Only reached once something has subscribed to the meta. With no
+    // subscribers the transition is unobservable except through getMeta(), so
+    // the callers below just store it — which is most calls, since subscribing
+    // to an action's status is opt-in.
     const setMeta = (callId: number, next: ActionMeta) => {
       if (callId !== latestCall) return;
       if (meta.status === next.status && meta.error === next.error) return;
       meta = next;
-      if (metaListeners !== null) {
-        for (const l of metaListeners) l(meta);
-      }
+      for (const l of metaListeners as Set<(meta: ActionMeta) => void>) l(meta);
     };
 
     // One context class per runner: call contexts are monomorphic instances
@@ -902,7 +954,8 @@ export function createStore<T extends object, D extends object = Record<never, n
             (afterActionHooks[i] as StoicPlugin<T, Full>).afterAction?.(event);
           }
         }
-        setMeta(this.callId, outcome);
+        if (metaListeners !== null) setMeta(this.callId, outcome);
+        else if (this.callId === latestCall) meta = outcome;
       }
     }
 
@@ -911,7 +964,24 @@ export function createStore<T extends object, D extends object = Record<never, n
     // straight through and no per-call closure is built at all.
     if (!attributed) CallCtx.prototype.set = setState;
 
-    const runner = (...args: unknown[]) => {
+    // A plain function reading `arguments` rather than an arrow with a rest
+    // parameter: the rest parameter allocates an array on every call, which is
+    // exactly what this avoids. (`noArguments` is turned off for this file in
+    // biome.json for the same reason.) Nothing here touches `this`, so the
+    // handle stays safe to destructure off the actions object.
+    const runner = function (): unknown {
+      // A rest parameter allocates an array on *every* call, and the only
+      // things that ever read it are the two action hooks and the attribution
+      // closure — none of which most stores have. `argsWanted` is constant per
+      // store, so this branch is perfectly predicted, and when it is false the
+      // arguments object never escapes and V8 elides it entirely.
+      const argc = arguments.length;
+      let args: unknown[] = NO_ARGS;
+      if (argsWanted && argc !== 0) {
+        args = new Array(argc);
+        for (let i = 0; i < argc; i++) args[i] = arguments[i];
+      }
+
       if (currentController !== null) {
         activeControllers?.delete(currentController);
         const previous = currentController;
@@ -934,7 +1004,11 @@ export function createStore<T extends object, D extends object = Record<never, n
       // usually exactly what puts a spinner on screen. Skipping it for calls
       // that turn out to be synchronous measured ~2ns on action:sync, which is
       // not worth making the async case wrong.
-      setMeta(callId, PENDING_META);
+      // This call *is* the newest by construction, so the latest-call guard
+      // inside setMeta cannot reject it — with nobody subscribed there is
+      // nothing left for the call to do but the store.
+      if (metaListeners !== null) setMeta(callId, PENDING_META);
+      else meta = PENDING_META;
       const ctx = new CallCtx(callId, args);
 
       let result: unknown;
@@ -943,13 +1017,13 @@ export function createStore<T extends object, D extends object = Record<never, n
         // which builds an argument list at run time. Actions take 0–2 arguments
         // almost always; anything longer falls back.
         result =
-          args.length === 0
+          argc === 0
             ? fn(ctx)
-            : args.length === 1
-              ? fn(ctx, args[0])
-              : args.length === 2
-                ? fn(ctx, args[0], args[1])
-                : fn(ctx, ...args);
+            : argc === 1
+              ? fn(ctx, arguments[0])
+              : argc === 2
+                ? fn(ctx, arguments[0], arguments[1])
+                : fn(ctx, ...arguments);
       } catch (err) {
         ctx.settle({ status: "error", error: err });
         throw err;
@@ -959,11 +1033,14 @@ export function createStore<T extends object, D extends object = Record<never, n
       // like promises, not like sync returns. `Promise.resolve` assimilates
       // them — and returns a native promise unchanged, so the common async
       // case pays only the failed `instanceof`.
+      //
+      // The `typeof` gate goes first: a sync action almost always returns
+      // `undefined`, which fails it immediately, where leading with
+      // `instanceof Promise` made every such call walk a prototype chain first.
       if (
-        result instanceof Promise ||
-        (result !== null &&
-          typeof result === "object" &&
-          typeof (result as PromiseLike<unknown>).then === "function")
+        typeof result === "object" &&
+        result !== null &&
+        (result instanceof Promise || typeof (result as PromiseLike<unknown>).then === "function")
       ) {
         return Promise.resolve(result).then(
           (value) => {
