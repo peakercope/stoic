@@ -22,6 +22,16 @@ type ReadableStore<Full> = {
   subscribe: (listener: (state: Full) => void) => () => void;
 };
 
+// One record per mounted `useStore`, holding the current arguments and the last
+// selection so `read` can close over the record instead of the arguments.
+type Inst<Full, U> = {
+  store: ReadableStore<Full>;
+  selector: (state: Full) => U;
+  equality: (a: U, b: U) => boolean;
+  selected: U | typeof UNSET;
+  read: () => U;
+};
+
 /**
  * React hook: subscribes the component to `store`. Without a selector it
  * returns the full state (re-rendering on every change); with a `selector`
@@ -34,27 +44,55 @@ export function useStore<Full extends object, U = Full>(
   selector: (state: Full) => U = identity as (state: Full) => U,
   equality: (a: U, b: U) => boolean = Object.is,
 ): U {
-  // Sentinel-gated so the selector doesn't run on every render just to
-  // produce a discarded useRef initializer.
-  const selectedRef = useRef<U | typeof UNSET>(UNSET);
-  if (selectedRef.current === UNSET) selectedRef.current = selector(store.getState());
+  // Everything the read needs lives in one mutable record behind one ref, and
+  // `read` closes over that record rather than over the arguments. So `read` is
+  // allocated once per component and never changes identity — which is the
+  // point, because React keys work on that identity: `useSyncExternalStore`
+  // re-runs its store-instance effect whenever `getSnapshot` differs from last
+  // render, and that effect calls `getSnapshot` again. A `read` rebuilt per
+  // render therefore cost a passive effect plus a second full selector run on
+  // *every* render of *every* subscribed component.
+  //
+  // Rebuilding it only when `[store, selector, equality]` change was measured
+  // and rejected: consumers write the selector inline, so those deps differ on
+  // every render anyway and the memo just adds a deps array to the same work.
+  const instRef = useRef<Inst<Full, U> | null>(null);
+  let inst = instRef.current;
 
-  // React calls the snapshot functions repeatedly and compares the results with
-  // `Object.is`, so an object-literal selector must return the *same* reference
-  // until the selection actually changes. This applies to the server snapshot
-  // too: returning a fresh object there makes React bail out with "The result of
-  // getServerSnapshot should be cached to avoid an infinite loop" on hydration.
-  const read = () => {
-    const next = selector(store.getState());
+  if (inst === null) {
+    const created: Inst<Full, U> = {
+      store,
+      selector,
+      equality,
+      selected: UNSET,
+      // React calls the snapshot functions repeatedly and compares the results
+      // with `Object.is`, so an object-literal selector must return the *same*
+      // reference until the selection actually changes. This applies to the
+      // server snapshot too: returning a fresh object there makes React bail
+      // out with "The result of getServerSnapshot should be cached to avoid an
+      // infinite loop" on hydration.
+      read: () => {
+        const next = created.selector(created.store.getState());
+        const prev = created.selected;
+        // The cast is the sentinel narrowing: `U` is generic, so the checker
+        // cannot see that `prev !== UNSET` leaves only `U`.
+        if (prev !== UNSET && created.equality(prev as U, next)) return prev as U;
+        created.selected = next;
+        return next;
+      },
+    };
+    inst = instRef.current = created;
+  } else {
+    // Latest values for the next read. Writing during render is what keeps a
+    // stable `read` correct when a selector closes over changing props: the
+    // committed render is always the last one to run before React reads the
+    // snapshot, so the record it leaves behind is the committed one.
+    inst.store = store;
+    inst.selector = selector;
+    inst.equality = equality;
+  }
 
-    if (!equality(selectedRef.current as U, next)) {
-      selectedRef.current = next;
-    }
-
-    return selectedRef.current as U;
-  };
-
-  return useSyncExternalStore(store.subscribe, read, read);
+  return useSyncExternalStore(store.subscribe, inst.read, inst.read);
 }
 
 /**

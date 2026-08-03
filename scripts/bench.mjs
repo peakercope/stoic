@@ -12,7 +12,8 @@
 //   node scripts/bench.mjs --case set:derived-read2   run one case (used internally)
 //   node scripts/bench.mjs --filter action     run only cases matching a substring
 //
-// Always `yarn build` first — the cases import ../dist/index.js.
+// Always `yarn build` first — the cases import ../dist/index.js (and, for the
+// `render:` cases, ../dist/react.js).
 
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -25,6 +26,9 @@ const SELF = fileURLToPath(import.meta.url);
 // function to time. `iters` is tuned so every case runs for roughly a tenth of
 // a second per round; a case must return a number so the accumulator keeps the
 // work observably live.
+//
+// A case declaring `needs: "react"` gets a second `setup` argument carrying a
+// DOM, React, and the built `useStore` — see makeReactCtx.
 
 const state3 = () => ({ count: 0, name: "a", other: 1 });
 
@@ -48,6 +52,30 @@ const fanoutDerived = {
   d5: (s) => s.a5 * 2,
   d6: (s) => s.a6 * 2,
   d7: (s) => s.a7 * 2,
+};
+
+// Sixty-four raw keys, one per subscribed component in the fan-out cases below.
+// A real tree subscribes far more components than a store has derived cells,
+// and the per-notify cost scales with the former, not the latter.
+const wideState = (n) => {
+  const state = {};
+  for (let i = 0; i < n; i++) state[`a${i}`] = i;
+  return state;
+};
+
+// Subscribes one listener per key, each running a selector and bailing on an
+// equality check — what `useStore` does for every mounted component on every
+// notify. The selector is compiled rather than closed over a key variable so
+// the property access is the literal `s.a3` form a consumer would write.
+const subscribeSelectors = (store, keys) => {
+  for (const key of keys) {
+    const selector = new Function("s", `return s.${key}`);
+    let prev = selector(store.getState());
+    store.subscribe((s) => {
+      const next = selector(s);
+      if (!Object.is(prev, next)) prev = next;
+    });
+  }
 };
 
 const CASES = {
@@ -244,6 +272,54 @@ const CASES = {
     },
   },
 
+  // ── subscriber fan-out: what a notify costs once a tree is mounted ──
+  // Every subscribed component re-runs its selector on every store write and
+  // bails on the equality check — that O(components) cost is what `useStore`
+  // actually spends per write, and nothing else in the suite measures it.
+  // Modelled without React on purpose: React's own per-commit work is in the
+  // µs range and would bury a ns-scale signal (the `render:` cases below cover
+  // the end-to-end number at that coarser resolution).
+  //
+  // The pair isolates the two halves. `-1changed` is the realistic shape — one
+  // component's slice moves and 63 selectors run only to bail — while the
+  // unsuffixed case makes all 64 selections change, so none of them bail.
+  // Both cases subscribe 64 selectors that differ only in which key they read,
+  // so the pair isolates bail-vs-change and nothing else. `subscribeSelectors`
+  // compiles each one to a literal property access, because a closure over a
+  // computed key (`s[k]`) is a different and much slower access in V8 than the
+  // `s => s.count` consumers actually write — measuring that instead would put
+  // a 3.6x artifact between two cases meant to be read against each other.
+  "notify:selector-fanout-64": {
+    iters: 2e5,
+    setup: (createStore) => {
+      const store = createStore({ state: wideState(64) });
+      // Every selector reads the key the timed write touches: nothing bails.
+      subscribeSelectors(store, new Array(64).fill("a0"));
+      let i = 0;
+      return () => {
+        store.setState({ a0: i++ });
+        return 0;
+      };
+    },
+  },
+  "notify:selector-fanout-64-1changed": {
+    iters: 2e5,
+    setup: (createStore) => {
+      const store = createStore({ state: wideState(64) });
+      // One selector per key, so 63 of them run only to bail — the shape a
+      // mounted tree actually has.
+      subscribeSelectors(
+        store,
+        Array.from({ length: 64 }, (_, n) => `a${n}`),
+      );
+      let i = 0;
+      return () => {
+        store.setState({ a0: i++ });
+        return 0;
+      };
+    },
+  },
+
   // ── reads ──
   "read:repeat-derived": {
     iters: 1e7,
@@ -314,7 +390,146 @@ const CASES = {
       };
     },
   },
+
+  // ── React: the binding, end to end ──
+  // Coarser than the `notify:` cases — React's per-commit work is µs-scale and
+  // partly masks a ns-scale delta — so these confirm a win survives in the
+  // units a consumer feels, rather than being the instrument that detects it.
+  //
+  // Selectors are written inline, because that is what consumers write and
+  // because a memo keyed on selector identity is worthless for exactly that
+  // shape.
+  "render:mount-64": {
+    iters: 2e3,
+    needs: "react",
+    setup: (createStore, { createElement, createRoot, flushSync, useStore, document }) => {
+      const store = createStore({ state: wideState(64) });
+      const Leaf = ({ k }) =>
+        createElement(
+          "span",
+          null,
+          useStore(store, (s) => s[k]),
+        );
+      const App = () => {
+        const kids = [];
+        for (let i = 0; i < 64; i++) kids.push(createElement(Leaf, { key: i, k: `a${i}` }));
+        return createElement("div", null, kids);
+      };
+      return () => {
+        // A fresh container per iteration: reusing one across mount/unmount
+        // cycles makes React warn about re-rooting a used node.
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        const root = createRoot(container);
+        flushSync(() => root.render(createElement(App)));
+        // Outside flushSync — unmounting synchronously from inside a flush
+        // warns about tearing down a root mid-render.
+        root.unmount();
+        container.remove();
+        return 0;
+      };
+    },
+  },
+  "render:update-64-1changed": {
+    iters: 2e4,
+    needs: "react",
+    setup: (createStore, { createElement, createRoot, flushSync, useStore, document }) => {
+      const store = createStore({ state: wideState(64) });
+      const Leaf = ({ k }) =>
+        createElement(
+          "span",
+          null,
+          useStore(store, (s) => s[k]),
+        );
+      const App = () => {
+        const kids = [];
+        for (let i = 0; i < 64; i++) kids.push(createElement(Leaf, { key: i, k: `a${i}` }));
+        return createElement("div", null, kids);
+      };
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      flushSync(() => root.render(createElement(App)));
+      let i = 0;
+      return () => {
+        // 64 subscribers wake, 63 bail on equality, 1 re-renders.
+        flushSync(() => store.setState({ a0: i++ }));
+        return 0;
+      };
+    },
+  },
+  // No store write at all: a parent re-render drags 64 `useStore` calls through
+  // a render each. This is the case that isolates the per-render cost of the
+  // binding itself — an unstable `getSnapshot` identity makes React schedule a
+  // passive effect and re-run the selector once more on every one of them.
+  "render:rerender-parent-64": {
+    iters: 2e4,
+    needs: "react",
+    setup: (createStore, { createElement, createRoot, flushSync, useStore, document }) => {
+      const store = createStore({ state: wideState(64) });
+      // A second store drives the parent, so the timed loop re-renders the tree
+      // without touching the store the leaves read.
+      const tick = createStore({ state: { n: 0 } });
+      const Leaf = ({ k }) =>
+        createElement(
+          "span",
+          null,
+          useStore(store, (s) => s[k]),
+        );
+      const App = () => {
+        useStore(tick, (s) => s.n);
+        const kids = [];
+        for (let i = 0; i < 64; i++) kids.push(createElement(Leaf, { key: i, k: `a${i}` }));
+        return createElement("div", null, kids);
+      };
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      flushSync(() => root.render(createElement(App)));
+      let i = 0;
+      return () => {
+        flushSync(() => tick.setState({ n: i++ }));
+        return 0;
+      };
+    },
+  },
 };
+
+// ─── React context (built only for cases that ask for it) ─────────────────────
+
+// Installing a DOM and loading react-dom costs ~100 ms and permanently dirties
+// the global object, so it happens lazily and only for `needs: "react"` cases.
+// Every case already runs in its own child process, so nothing else can see it.
+async function makeReactCtx() {
+  const { GlobalWindow } = await import("happy-dom");
+  const win = new GlobalWindow({ url: "http://localhost" });
+
+  // Node defines some of these (navigator) as getter-only on globalThis, so a
+  // plain assignment throws.
+  const put = (key, value) =>
+    Object.defineProperty(globalThis, key, { value, writable: true, configurable: true });
+
+  for (const key of Object.getOwnPropertyNames(win)) {
+    if (key in globalThis) continue;
+    try {
+      put(key, win[key]);
+    } catch {}
+  }
+  put("window", win);
+  put("document", win.document);
+  put("navigator", win.navigator);
+  // `act` is not used — its own bookkeeping is heavier than what these cases
+  // measure — so tell React not to expect it.
+  put("IS_REACT_ACT_ENVIRONMENT", false);
+
+  // Imported after the globals land: react-dom reads them at module scope.
+  const { createElement } = await import("react");
+  const { createRoot } = await import("react-dom/client");
+  const { flushSync } = await import("react-dom");
+  const { useStore } = await import("../dist/react.js");
+
+  return { createElement, createRoot, flushSync, useStore, document: win.document };
+}
 
 // ─── single-case runner (child process) ───────────────────────────────────────
 
@@ -323,7 +538,8 @@ async function runCase(name) {
   const def = CASES[name];
   if (def === undefined) throw new Error(`unknown case: ${name}`);
 
-  const fn = def.setup(createStore);
+  const ctx = def.needs === "react" ? await makeReactCtx() : undefined;
+  const fn = def.setup(createStore, ctx);
   const iters = def.iters;
 
   const round = def.async

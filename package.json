@@ -67,6 +67,7 @@
     "dev": "tsdown --watch",
     "test": "vitest run",
     "bench": "yarn build && node scripts/bench.mjs",
+    "size": "yarn build && node scripts/size.mjs",
     "typecheck": "tsc --noEmit && node scripts/typecheck-examples.mjs",
     "format": "biome check --write",
     "lint": "biome ci",

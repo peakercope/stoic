@@ -1476,6 +1476,96 @@ describe("useStore", () => {
     container.remove();
   });
 
+  it("does not re-run an inline selector from a re-scheduled snapshot effect", () => {
+    // Guards the reason `read` keeps a stable identity. `useSyncExternalStore`
+    // re-runs its store-instance effect whenever `getSnapshot` differs from the
+    // previous render, and that effect calls `getSnapshot` again — so a `read`
+    // rebuilt per render costs an extra full selector pass on every render of
+    // every subscribed component. The selector here is inline, and so has a new
+    // identity every render, because that is what consumers write and the case
+    // a memo keyed on selector identity cannot help.
+    //
+    // The expected delta is two render-phase calls: React's development build
+    // deliberately invokes `getSnapshot` twice to check the result is cached.
+    // What must not appear is the third call, from the effect. (Measured at 3
+    // before this change and 2 after; a store *write* costs 4 either way, since
+    // that path re-reads through the subscription regardless.)
+    const store = createStore({ state: { count: 0 } });
+    const selectorCalls = vi.fn();
+    let forceRender = () => {};
+
+    function Component() {
+      const [, setTick] = React.useState(0);
+      forceRender = () => {
+        setTick((n) => n + 1);
+      };
+      useStore(store, (s) => {
+        selectorCalls();
+        return s.count;
+      });
+      return null;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<Component />));
+
+    const afterMount = selectorCalls.mock.calls.length;
+    act(() => {
+      forceRender();
+    });
+    expect(selectorCalls.mock.calls.length).toBe(afterMount + 2);
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("commits the current selector when a transition render interleaves with a sync update", () => {
+    // `read` closes over a record that every render writes to, so the committed
+    // render must be the one that wins. A transition renders at low priority and
+    // a sync update can interrupt it, which is the shape where a record left by
+    // a render that never committed would surface.
+    const store = createStore({ state: { a: 1, b: 2 } });
+    let latest = 0;
+    let setWhich: (w: "a" | "b") => void = () => {};
+    let setSync: (n: number) => void = () => {};
+
+    function Component() {
+      const [which, updateWhich] = React.useState<"a" | "b">("a");
+      const [n, updateSync] = React.useState(0);
+      setWhich = updateWhich;
+      setSync = updateSync;
+      latest = useStore(store, (s) => s[which]);
+      return <span>{n}</span>;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<Component />));
+    expect(latest).toBe(1);
+
+    act(() => {
+      React.startTransition(() => {
+        setWhich("b");
+      });
+      setSync(1);
+    });
+
+    // Both updates committed, so the selection must match the committed prop.
+    expect(latest).toBe(2);
+
+    // And the record is still live: the committed selector keeps tracking.
+    act(() => {
+      store.setState({ b: 20 });
+    });
+    expect(latest).toBe(20);
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
   it("does not re-render children when a change only touches unrelated derived values", () => {
     // Mirrors the shopping-cart example: a parent selects `items` plus a derived
     // count, while an unrelated raw key feeds a *different* derived value. The
