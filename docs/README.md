@@ -39,6 +39,7 @@ New here? Read [Installation](./installation.md), then [Quick Start](./quick-sta
 | --- | --- |
 | [API Reference](./api-reference.md) | Every export of every entry point, with signatures. |
 | [FAQ](./faq.md) | Multiple stores, Server Components, SSR, concurrent rendering. |
+| [Versioning](./versioning.md) | What the stability promise covers, and what it doesn't. |
 | [Philosophy](./philosophy.md) | The principles behind the library's design. |
 
 Runnable examples live in [`examples/`](../examples).

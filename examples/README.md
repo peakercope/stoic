@@ -3,14 +3,25 @@
 Self-contained applications, each solving a realistic problem and teaching one or multiple
 Stoic concepts. Every example is a standalone Vite + React + TypeScript app that imports
 Stoic by its published name (`stoic-store`), so the code is copy-pasteable into a real app;
-a Vite alias points those imports at this repository's `src/`, so changes to the library
-show up immediately.
+a Vite alias points those imports at this repository's **build output** (`dist/prod/`), so
+each example runs against the same code npm ships.
+
+Because they resolve to the build, **build the library first** — `dist/` is not checked in,
+so a fresh clone has nothing for the alias to point at:
 
 ```bash
+# once, from the repository root
+yarn install
+yarn build
+
+# then, per example
 cd examples/shopping-cart
 yarn install
 yarn dev
 ```
+
+Re-run `yarn build` at the root after changing anything in `src/` — Vite is watching the
+example, not the library.
 
 | Example | Teaches | Highlights |
 | --- | --- | --- |
