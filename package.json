@@ -11,6 +11,14 @@
     "state-management",
     "store",
     "derived-state",
+    "computed",
+    "reactive",
+    "hooks",
+    "usesyncexternalstore",
+    "selector",
+    "persist",
+    "devtools",
+    "ssr",
     "typescript"
   ],
   "homepage": "https://github.com/peakercope/stoic#readme",
@@ -59,15 +67,22 @@
   "files": [
     "dist"
   ],
+  "engines": {
+    "node": ">=18"
+  },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "bench": "yarn build && node scripts/bench.mjs",
     "size": "yarn build && node scripts/size.mjs",
+    "size:check": "yarn build && node scripts/size.mjs --base size-baseline.json --max-growth 64",
+    "check:package": "yarn build && publint && attw --pack . --profile esm-only",
     "typecheck": "tsc --noEmit && node scripts/typecheck-examples.mjs",
     "format": "biome check --write",
     "lint": "biome ci",
@@ -85,6 +100,7 @@
     }
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@biomejs/biome": "2.5.6",
     "@changesets/cli": "^2.31.1",
     "@redux-devtools/extension": "^4.0.0",
@@ -95,6 +111,7 @@
     "@vitejs/plugin-react": "^6.0.5",
     "@vitest/coverage-v8": "4.1.10",
     "happy-dom": "^20.11.1",
+    "publint": "^0.3.22",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "redux": "5.0.1",
