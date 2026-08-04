@@ -1,0 +1,32 @@
+{
+  ".": {
+    "raw": 5439,
+    "gzip": 2470,
+    "chunks": 2
+  },
+  "./react": {
+    "raw": 1318,
+    "gzip": 640,
+    "chunks": 1
+  },
+  "./tools": {
+    "raw": 766,
+    "gzip": 332,
+    "chunks": 1
+  },
+  "./plugins": {
+    "raw": 9765,
+    "gzip": 4168,
+    "chunks": 4
+  },
+  "./plugins/persist": {
+    "raw": 8400,
+    "gzip": 3631,
+    "chunks": 2
+  },
+  "./plugins/devtools": {
+    "raw": 6512,
+    "gzip": 2968,
+    "chunks": 2
+  }
+}

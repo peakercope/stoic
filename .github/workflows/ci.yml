@@ -2,10 +2,17 @@ name: CI
 
 on:
   pull_request:
+  # Also on main. The release workflow publishes from here after only typecheck
+  # and test, so without this the lint, build, package and bundle-size gates
+  # would never run against the commit that actually ships.
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR pushes are worth cancelling; main commits are not — each one
+  # is a candidate to publish, so each one gets verified.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
@@ -33,10 +40,29 @@ jobs:
         run: yarn lint
 
       - name: Test
-        run: yarn test
+        run: yarn test:coverage
 
       - name: Build
         run: yarn build
+
+      # docs/api-reference.md is hand-written, so nothing else fails when an
+      # export lands undocumented. Reads the built .d.ts of every entry point.
+      - name: Check API reference
+        run: node scripts/api-drift.mjs
+
+      # Validates the published shape rather than the source: an ESM-only
+      # package with six hand-shaped subpaths and a `production` condition has
+      # a lot of ways to be silently unresolvable for a consumer. The esm-only
+      # profile ignores the two findings inherent to shipping ESM only (no CJS
+      # require, no pre-`exports` node10 resolution) and still checks that every
+      # subpath resolves for bundlers and for `import` from ESM.
+      - name: Check published package
+        run: yarn check:package
+
+      # "Small bundle size is a feature" needs a gate, or it is a preference.
+      # Budgeted, not zero-tolerance — see scripts/size.mjs.
+      - name: Check bundle size
+        run: yarn size:check
 
   # The peer range allows React >=18, so the suite must also pass against the
   # oldest supported major.

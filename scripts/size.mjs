@@ -5,6 +5,9 @@
 //   node scripts/size.mjs --save size.json      …and write the numbers to a file
 //   node scripts/size.mjs --base size.json      …and diff against an earlier run
 //   node scripts/size.mjs --filter react        only entries matching a substring
+//   node scripts/size.mjs --base size.json --max-growth 64
+//                                               …and exit 1 if an entry grew by
+//                                               more than 64 gzip bytes
 //
 // Always `yarn build` first — this reads dist/prod.
 //
@@ -81,8 +84,9 @@ function report(results, base) {
   const names = Object.keys(results);
   if (names.length === 0) {
     console.log("no entries matched (--filter is a plain substring, not a regex)");
-    return;
+    return [];
   }
+  const grown = [];
   const width = Math.max(...names.map((n) => n.length), "entry".length);
   console.log(
     `\n${"entry".padEnd(width)}  ${"raw".padStart(9)}  ${"gzip".padStart(9)}${base ? "  vs base" : ""}`,
@@ -98,10 +102,12 @@ function report(results, base) {
       // size, so the same percentage means very different things across rows.
       // Anything at all is a signal — unlike a timing, a byte count is exact.
       delta = diff === 0 ? "  —" : `  ${diff > 0 ? "+" : ""}${diff} B${diff > 0 ? " !" : " *"}`;
+      if (diff > 0) grown.push({ name, diff });
     }
     console.log(`${name.padEnd(width)}  ${fmt(raw).padStart(9)}  ${fmt(gzip).padStart(9)}${delta}`);
   }
   if (base) console.log("\n* smaller   ! larger   (gzip bytes; exact, not sampled)");
+  return grown;
 }
 
 const argv = process.argv.slice(2);
@@ -112,11 +118,31 @@ const arg = (flag) => {
 
 const results = measure(arg("--filter"));
 const basePath = arg("--base");
-report(results, basePath ? JSON.parse(readFileSync(basePath, "utf8")) : undefined);
+const grown = report(results, basePath ? JSON.parse(readFileSync(basePath, "utf8")) : undefined);
 
 const savePath = arg("--save");
 if (savePath) {
   const { writeFileSync } = await import("node:fs");
   writeFileSync(savePath, `${JSON.stringify(results, null, 2)}\n`);
   console.log(`\nsaved to ${savePath}`);
+}
+
+// The CI gate. A budget rather than zero tolerance: minifier and bundler
+// upgrades move these numbers by a few bytes on their own, and a check that
+// cries wolf on every dependency bump gets ignored — which is worse than not
+// having one. Growth beyond the budget is a deliberate decision, so it should
+// cost a baseline update and show up in review as one.
+const maxGrowth = arg("--max-growth");
+if (maxGrowth !== undefined && grown.length > 0) {
+  const budget = Number(maxGrowth);
+  const over = grown.filter(({ diff }) => diff > budget);
+  if (over.length > 0) {
+    console.error(
+      `\nbundle size regression (budget ${budget} B gzip):\n` +
+        over.map(({ name, diff }) => `  ${name}  +${diff} B`).join("\n") +
+        "\n\nIf the growth is intended, re-save the baseline:\n" +
+        `  yarn size --save ${basePath ?? "size-baseline.json"}`,
+    );
+    process.exit(1);
+  }
 }
