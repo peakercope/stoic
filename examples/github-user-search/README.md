@@ -4,6 +4,10 @@ Search GitHub users, open a profile, and sort/filter their repositories — agai
 real GitHub REST API.
 
 ```bash
+# once, from the repository root: the Vite alias resolves to dist/prod
+yarn install && yarn build
+
+# then, here
 yarn install
 yarn dev
 ```

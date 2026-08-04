@@ -68,7 +68,14 @@ byte shipped and every type inferred by a consumer's editor is part of the produ
 - Config extends `@tsconfig/strictest` — keep it passing with no suppressions.
   `any`, `as` casts, and `@ts-expect-error` in `src/` need a comment justifying them.
 - Excellent inference is a core feature: consumers should never write type annotations
-  that Stoic can infer (state, action arguments, derived values).
+  that Stoic can infer (state, action arguments, selector results, action return types).
+- The one deliberate exception is `createStore<State, Derived>`. Derived value types cannot be
+  inferred *and* keep derived-on-derived reads typed — that is a fixed point TypeScript cannot
+  solve, not an implementation shortcut. Measured across 13 candidate signatures (return-position
+  inference, self-referential intersections, `NoInfer`, a defaulted `Self` parameter): inference
+  succeeds only when the derived function's parameter excludes the derived values, which would
+  break chaining — the headline feature. Don't re-litigate without a new TS capability; see
+  `docs/typescript.md`.
 - Public type changes must be covered in `src/types.test-d.ts`. If you change generics or
   overloads, add a type test showing inference still works from the consumer's side.
 - Complex internal types are acceptable only when they buy simpler *external* types.
