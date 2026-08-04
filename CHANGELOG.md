@@ -1,5 +1,91 @@
 # stoic
 
+## 1.0.0
+
+### Major Changes
+
+- 6d30050: Stoic is 1.0.
+
+  Nothing is removed or renamed in this release — if you are on `0.15.x`, upgrading is a version bump
+  and nothing else. What changes is the commitment: from here on, **no breaking change ships in a
+  minor or patch release**.
+
+  [Versioning](https://github.com/peakercope/stoic/blob/main/docs/versioning.md) spells out exactly
+  what that covers. In short, the stable surface is everything in the
+  [API Reference](https://github.com/peakercope/stoic/blob/main/docs/api-reference.md) — `createStore`
+  and the store's methods, the React hooks, `shallow`, `derivedKeysOf`, the built-in plugins' options
+  — plus the exported types and the inference you get from them, the entry points, the plugin hook
+  contract and its ordering, and the documented notification and batching semantics. A change that
+  forces you to add a type annotation you didn't need before counts as breaking, even if it compiles.
+
+  Deliberately outside the promise: dev-only warning text, exact bundle size, performance
+  characteristics, and anything reachable only through internals — a `dist/` path, a `@internal` type,
+  or `Object.getOwnPropertySymbols(store)`.
+
+  Two design decisions are worth stating plainly, because 1.0 freezes both:
+
+  - **Derived stores spell out their types** — `createStore<State, Derived>`. This is a TypeScript
+    limitation rather than a temporary shortcut: a derived function's parameter includes the derived
+    values, so `Derived` sits in both an inference source and an inference target at once, and there
+    is no fixed-point inference in the language. Thirteen candidate signatures were measured; every
+    one of them either inferred the types or kept chained derived reads typed, never both. See
+    [TypeScript](https://github.com/peakercope/stoic/blob/main/docs/typescript.md#why-derived-cant-be-inferred).
+  - **Plugins observe; they don't intercept.** Every hook returns `void`. There is no middleware
+    chain, and installing a plugin cannot change what your store does — only what else watches it. See
+    [Philosophy](https://github.com/peakercope/stoic/blob/main/docs/philosophy.md).
+
+### Minor Changes
+
+- 6d30050: Export `derivedKeysOf`, so third-party plugins can tell derived values from raw state.
+
+  Derived values are getters on a shared prototype that resolve into a private field, so no reflection
+  over a snapshot distinguishes them: `Object.keys`, `getOwnPropertyNames` and descriptor checks all
+  report exactly the raw state keys. `derivedKeysOf(store)` returns the declared derived keys (a copy,
+  in declaration order), which is what `persist` needs to keep computed values out of storage and what
+  `devtools` needs to read them back in for the extension to serialize.
+
+  It already existed and both built-in plugins already used it — it was just marked `@internal` and
+  not exported, which left first-party plugins with a capability nobody else could replicate. Since
+  the plugin contract is one of the things a stable release freezes, that asymmetry is worth removing
+  now. Application code rarely needs this.
+
+  ```ts
+  import { derivedKeysOf, type StoicPlugin } from "stoic-store";
+
+  export function logger(): StoicPlugin {
+    let derived: readonly string[] = [];
+    return {
+      onInit(store) {
+        derived = derivedKeysOf(store); // fixed at creation — read once, keep it
+      },
+    };
+  }
+  ```
+
+### Patch Changes
+
+- 6d30050: Fix `destroy()` leaving a store half torn down when a plugin's `onDestroy` hook throws.
+
+  `destroy()` set the destroyed flag first and retired the listeners last, so a throw in between left
+  the worst of both states: `setState` was ignored, but every listener was still subscribed and the
+  live-listener count no longer described the list. The visible symptom was a store destroyed from
+  inside a notification — the dispatch loop is holding a length it read before `destroy()` ran, and
+  only the retired slots stop it from calling the listeners ordered after the one that destroyed the
+  store, so those listeners ran against a destroyed store. The rest of the time it was a leak: the
+  listeners, and everything their closures held, were retained for good.
+
+  The hook loop now runs inside a `try`, with the teardown in the `finally`. The error still
+  propagates — a plugin that fails to clean up is the caller's problem, matching the contract a
+  throwing subscriber already has — but it can no longer strand the store on the way out.
+
+  `destroy()` is a cold path with no benchmark case; a same-session A/B over the whole suite showed no
+  movement outside noise. The core entry grew from 2.40 kB to 2.41 kB gzipped.
+
+  Plugin hooks are still not wrapped in `try`/`catch` anywhere else, and that stays deliberate. What
+  each hook does when it throws is now specified in
+  [Writing a plugin](https://github.com/peakercope/stoic/blob/main/docs/plugins/writing-a-plugin.md#errors)
+  and pinned by tests for all five hooks.
+
 ## 0.15.4
 
 ### Patch Changes
