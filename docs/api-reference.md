@@ -63,6 +63,16 @@ Listeners are called in subscription order, and the set of listeners for a chang
 
 Thrown when derived values depend on each other in a cycle, with a message describing the cycle. Derived values are lazy, so it surfaces on the read that walks into the cycle.
 
+### `derivedKeysOf(store)`
+
+```ts
+derivedKeysOf(store: object): readonly string[];
+```
+
+The derived keys a store declares, in declaration order; empty for a store without derived state. Returns a copy.
+
+For [plugin authors](./plugins/writing-a-plugin.md#telling-derived-keys-apart): derived values are prototype getters resolving into a private field, so no reflection over a snapshot can tell them apart from raw state. Application code rarely needs this.
+
 ## `stoic-store/react`
 
 ### `useStore(store, selector?, equality?)`
@@ -111,7 +121,7 @@ One store per mounted `Provider`. The `init` prop is required exactly when the f
 | [`devtools`](./plugins/devtools.md) | `devtools<T, Full>(options?): StoicPlugin<T, Full>` — Redux DevTools integration. |
 | `webStorage` | `webStorage(getStorage?: () => Storage): PersistDriver` — the default driver; `localStorage` unless you pass another `Storage`. |
 
-Types: `PersistDriver`, `PersistPlugin`.
+Types: `PersistDriver`, `PersistPlugin`. `DevtoolsOptions` is exported from `stoic-store/plugins/devtools` (not from this barrel).
 
 `PersistPlugin<T>` is a `StoicPlugin<T, T>` plus `rehydrate(): void`, which reads storage and merges the stored state into the store now (for [`skipHydration`](./plugins/persist.md#server-rendering-and-manual-hydration) setups).
 

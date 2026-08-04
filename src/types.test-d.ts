@@ -1,7 +1,13 @@
 import type { ComponentProps } from "react";
 import { describe, expectTypeOf, it } from "vitest";
 import { createStoreContext, useActionMeta, useStore } from "./react";
-import { type ActionMeta, createStore, type StoicPlugin, type StoicStore } from "./stoic";
+import {
+  type ActionMeta,
+  createStore,
+  derivedKeysOf,
+  type StoicPlugin,
+  type StoicStore,
+} from "./stoic";
 
 describe("action return types", () => {
   const store = createStore({ state: { count: 0, title: "" } });
@@ -142,6 +148,13 @@ describe("store state and derived inference", () => {
 
   it("a store with derived state is assignable to StoicStore<T, Full>", () => {
     expectTypeOf(derived).toExtend<StoicStore<State, State & Derived>>();
+  });
+
+  it("derivedKeysOf accepts any store and returns a readonly key list", () => {
+    expectTypeOf(derivedKeysOf(derived)).toEqualTypeOf<readonly string[]>();
+    // Also accepts a store with no derived state — a plugin does not know
+    // which kind it was attached to.
+    expectTypeOf(derivedKeysOf(plain)).toEqualTypeOf<readonly string[]>();
   });
 });
 

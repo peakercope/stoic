@@ -9,4 +9,4 @@ export type {
   StoicPlugin,
   StoicStore,
 } from "./stoic";
-export { CircularDependencyError, createStore } from "./stoic";
+export { CircularDependencyError, createStore, derivedKeysOf } from "./stoic";

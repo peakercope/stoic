@@ -1,5 +1,6 @@
 import { DEV } from "./env";
 
+/** A `store.subscribe` callback, called with the new state after every change. */
 export type Listener<T> = (state: T) => void;
 
 type DerivedConfig<T, D> = {
@@ -42,6 +43,11 @@ export type ActionCtx<T, Full = T> = {
 };
 type ActionFn<T, Full, A extends unknown[], R> = (ctx: ActionCtx<T, Full>, ...args: A) => R;
 
+/**
+ * Where an action's most recent call has got to. `"idle"` until it is first
+ * called; `"pending"` from the moment it is invoked (before the body runs, so a
+ * write made before the first `await` already sees it).
+ */
 export type ActionStatus = "idle" | "pending" | "success" | "error";
 
 /**
@@ -72,6 +78,15 @@ type ActionHandlesFor<M extends ActionMap<any, any>, T, Full> = {
   [K in keyof M]: M[K] extends ActionFn<T, Full, infer A, infer R> ? ActionHandle<A, R> : never;
 };
 
+/**
+ * A store, as returned by {@link createStore}. `T` is the raw state — the only
+ * thing `setState` can write — and `Full` is that plus the derived values,
+ * which is what every read returns. For a store without derived state the two
+ * are the same.
+ *
+ * Every member is bound to the store, so destructuring them is safe:
+ * `const { getState, setState } = store`.
+ */
 export type StoicStore<T, Full = T> = {
   /** Returns the current state, including derived values. */
   getState: () => Full;
@@ -190,6 +205,16 @@ type SnapCtor = {
 // ~13 ns for the walk, and it was the largest single item left in creating a
 // store with derived values. The class hangs off its node under a symbol, so it
 // can never collide with a key name.
+//
+// Deliberately never evicted. Entries are keyed on derived key *names*, which
+// are written into source code, so the trie is bounded by the program text and
+// settles after the first store of each shape — a WeakMap has nothing to hang
+// liveness off (the names are strings, and the classes are what we're caching),
+// and an LRU would trade a permanent bound for a recurring rebuild on the exact
+// path this cache exists to make fast. The one shape that grows without bound
+// is derived keys generated at run time (`d${userId}`), which also defeats the
+// per-store hidden-class sharing this enables; build one store per entity with
+// fixed key names instead.
 type ClassTrie = Map<string | symbol, ClassTrie | SnapCtor>;
 const CLASS_TRIE: ClassTrie = new Map();
 const TRIE_END = Symbol("stoic.trieEnd");
@@ -293,10 +318,19 @@ const cycleError = (keys: string[], stack: number[], index: number): CircularDep
 };
 
 /**
- * @internal Not part of the public API. Returns a copy, so the ordinary way of
- * reading the list cannot reorder or truncate the store's own. This is a
- * convenience for the first-party plugins, not a security boundary — the live
- * array is still reachable through `Object.getOwnPropertySymbols(store)`.
+ * Returns the derived keys a store declares, in declaration order — empty for a
+ * store without derived state.
+ *
+ * Plugins need this because a snapshot can't be introspected for it: derived
+ * values are getters on a shared prototype resolving into a private field, so
+ * they are neither own properties nor distinguishable by descriptor. Anything
+ * that serializes, diffs, or writes back state — `persist` and `devtools` both
+ * do — has to know which keys are computed so it can leave them out.
+ *
+ * Returns a copy, so the ordinary way of reading the list cannot reorder or
+ * truncate the store's own. That is a guard against accidents, not a security
+ * boundary — the live array is still reachable through
+ * `Object.getOwnPropertySymbols(store)`.
  */
 export const derivedKeysOf = (store: object): readonly string[] => {
   const keys = (store as { [DERIVED_KEYS]?: readonly string[] })[DERIVED_KEYS];
@@ -1080,15 +1114,26 @@ export function createStore<T extends object, D extends object = Record<never, n
       for (const controller of activeControllers) controller.abort();
       activeControllers.clear();
     }
-    if (destroyHooks !== null) {
-      for (const p of destroyHooks) p.onDestroy?.();
+    // The hooks run inside a try so that a plugin throwing from onDestroy still
+    // leaves a fully torn-down store. Without it the throw escaped between
+    // `destroyed = true` and the listener retirement below, which left the worst
+    // of both states: setState ignored, but every listener still subscribed and
+    // `liveSubs` describing a list that no longer matched. The error still
+    // propagates — a plugin that fails to clean up is the caller's problem, the
+    // same contract a throwing subscriber has — but it can no longer strand the
+    // store on its way out.
+    try {
+      if (destroyHooks !== null) {
+        for (const p of destroyHooks) p.onDestroy?.();
+      }
+    } finally {
+      // Retire the slots rather than truncating: destroy() is reachable from
+      // inside a listener, and the dispatch loop above is holding a length it
+      // read before this ran. compact() drops them once no dispatch is walking.
+      for (let i = 0; i < subs.length; i++) subs[i] = NOOP;
+      liveSubs = 0;
+      compact();
     }
-    // Retire the slots rather than truncating: destroy() is reachable from
-    // inside a listener, and the dispatch loop above is holding a length it
-    // read before this ran. compact() drops them once no dispatch is walking.
-    for (let i = 0; i < subs.length; i++) subs[i] = NOOP;
-    liveSubs = 0;
-    compact();
   };
 
   // The symbol sits in the literal so the store object gets its final shape

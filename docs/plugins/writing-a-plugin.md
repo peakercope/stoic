@@ -48,8 +48,65 @@ Called when `store.destroy()` is called.
 
 > Don't call `setState` from inside `afterSetState` or a subscriber — that's an update loop. Stoic warns in development on re-entrant updates and throws once the recursion exceeds a safety limit. If one value should follow another, express it as [derived state](../derived-state.md) instead. Note also what a re-entrant write does to ordering: the nested update notifies everyone immediately, and the interrupted notification then resumes with the *newest* snapshot — so later listeners can receive the same state twice and never observe the intermediate one.
 
-> A subscriber or hook that throws stops later subscribers from being notified for that update, and the error propagates to whoever called `setState` (or the action's `set`). Keep subscribers exception-safe.
+## Errors
+
+Stoic does **not** wrap plugin hooks in `try`/`catch`. A hook that throws propagates to whoever
+triggered it and stops the hooks and subscribers ordered after it — the same contract a throwing
+subscriber has. Hooks are on the critical path of every update, so keep them exception-safe: catch
+your own errors, and never let a logging or devtools plugin take an application down with it.
+
+What each hook does when it throws:
+
+| Hook | Where the error surfaces | What is skipped |
+| --- | --- | --- |
+| `onInit` | out of `createStore` — no store handle is returned | later plugins' `onInit` |
+| `beforeAction` | out of the action call | the action body, and everything after it |
+| `afterAction` | out of the action call, or as a rejection of its promise | later `afterAction` hooks; the action's meta never settles and stays `"pending"` |
+| `afterSetState` | out of `setState` (or the action's `set`, or `batch`) | later `afterSetState` hooks and **every subscriber** — React components will not re-render for that update |
+| `onDestroy` | out of `store.destroy()` | later `onDestroy` hooks |
+
+The state itself is never left inconsistent: by the time `afterSetState` runs the new snapshot is
+already the current one, so a throw cuts the announcement short, not the write.
+
+`destroy()` is the one hook that cannot leave the store half-torn-down. Even when an `onDestroy`
+hook throws, listeners are still retired and the store is fully destroyed before the error escapes —
+otherwise a failing plugin would strand a store that ignores writes but never releases its
+subscribers.
 
 ## Telling derived keys apart
 
-Snapshot property descriptors can't distinguish raw state from derived values: a derived key starts as a getter on the snapshot's prototype (not an own property at all) and memoizes itself into a plain own data property the first time it's read. A plugin that needs the distinction (as [`persist`](./persist.md) does) should take the derived key list — or the keys it operates on — as an option from its user, who knows the store's configuration.
+Snapshot property descriptors can't distinguish raw state from derived values. A derived key is a
+getter on the snapshot's shared prototype — never an own property — and it resolves into a private
+field, which no amount of reflection will show you. So `Object.keys`, `Object.getOwnPropertyNames`
+and descriptor checks all report exactly the raw state keys, whether or not a derived value has
+been read.
+
+Use `derivedKeysOf` instead:
+
+```ts
+import { derivedKeysOf, type StoicPlugin } from "stoic-store";
+
+export function logger(): StoicPlugin {
+  let derived: readonly string[] = [];
+
+  return {
+    onInit(store) {
+      derived = derivedKeysOf(store); // declaration order; empty without derived state
+    },
+    afterSetState(state, actionName) {
+      const raw = { ...state }; // own keys only — already excludes derived values
+      console.log(actionName ?? "setState", raw);
+    },
+  };
+}
+```
+
+It returns a copy, so holding on to it can't disturb the store. Two things worth knowing:
+
+- **A spread already excludes derived values.** `{ ...state }` copies own enumerable properties, and
+  derived values aren't own properties. You need `derivedKeysOf` when you want the opposite — to
+  *include* them (as [`devtools`](./devtools.md) does, reading each one explicitly so the extension
+  can serialize it), or to reject them from input (as [`persist`](./persist.md) does when validating
+  its `include` option).
+- **Read it in `onInit` and keep it.** The derived key set is fixed when the store is created and
+  never changes, so there is no reason to call it on every update.

@@ -2,6 +2,7 @@ import type {} from "@redux-devtools/extension";
 import { DEV } from "../env";
 import { derivedKeysOf, type StoicPlugin, type StoicStore } from "../stoic";
 
+/** Options for the {@link devtools} plugin. Every field is optional. */
 export interface DevtoolsOptions {
   /** Instance name in the DevTools dropdown; defaults to an auto-generated per-store name. */
   name?: string;
