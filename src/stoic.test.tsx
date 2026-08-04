@@ -4,7 +4,12 @@ import { createRoot, hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { refreshDevEnvForTests } from "../src/env";
-import { CircularDependencyError, createStore, type StoicPlugin } from "../src/stoic";
+import {
+  CircularDependencyError,
+  createStore,
+  derivedKeysOf,
+  type StoicPlugin,
+} from "../src/stoic";
 import { useActionMeta, useStore } from "./react";
 import { shallow } from "./tools/shallow";
 
@@ -1277,6 +1282,248 @@ describe("plugins", () => {
     store.setState({ count: 1 });
     expect(a).not.toHaveBeenCalled();
     expect(b).not.toHaveBeenCalled();
+  });
+});
+
+describe("plugin hook ordering", () => {
+  it("runs every hook in plugin registration order", () => {
+    const calls: string[] = [];
+    const track = (id: string): StoicPlugin<{ count: number }> => ({
+      onInit: () => void calls.push(`init:${id}`),
+      beforeAction: () => void calls.push(`before:${id}`),
+      afterAction: () => void calls.push(`after:${id}`),
+      afterSetState: () => void calls.push(`set:${id}`),
+      onDestroy: () => void calls.push(`destroy:${id}`),
+    });
+
+    const store = createStore({
+      state: { count: 0 },
+      plugins: [track("a"), track("b"), track("c")],
+    });
+    expect(calls).toEqual(["init:a", "init:b", "init:c"]);
+
+    calls.length = 0;
+    const { inc } = store.actions({ inc: (ctx) => ctx.set({ count: 1 }) });
+    inc();
+    // Within one action: beforeAction for all, then the write's afterSetState
+    // for all, then afterAction for all — each group in registration order.
+    expect(calls).toEqual([
+      "before:a",
+      "before:b",
+      "before:c",
+      "set:a",
+      "set:b",
+      "set:c",
+      "after:a",
+      "after:b",
+      "after:c",
+    ]);
+
+    calls.length = 0;
+    store.destroy();
+    expect(calls).toEqual(["destroy:a", "destroy:b", "destroy:c"]);
+  });
+
+  it("hands every plugin the same event object for one action call", () => {
+    const seen: unknown[] = [];
+    const capture = (): StoicPlugin<{ count: number }> => ({
+      beforeAction: (event) => void seen.push(event),
+    });
+    const store = createStore({ state: { count: 0 }, plugins: [capture(), capture()] });
+    const { add } = store.actions({ add: (ctx, n: number) => ctx.set({ count: n }) });
+
+    add(2);
+    expect(seen).toHaveLength(2);
+    // Pins the allocation contract: one event per call, not one per plugin. A
+    // plugin that mutates it is mutating what its neighbours see.
+    expect(seen[0]).toBe(seen[1]);
+  });
+});
+
+describe("derivedKeysOf", () => {
+  it("returns the derived keys in declaration order", () => {
+    const store = createStore<{ count: number }, { doubled: number; label: string }>({
+      state: { count: 1 },
+      derived: {
+        doubled: (s) => s.count * 2,
+        label: (s) => `n=${s.doubled}`,
+      },
+    });
+    expect(derivedKeysOf(store)).toEqual(["doubled", "label"]);
+  });
+
+  it("returns an empty list for a store without derived state", () => {
+    expect(derivedKeysOf(createStore({ state: { count: 1 } }))).toEqual([]);
+  });
+
+  it("returns a copy, so a caller cannot truncate the store's own list", () => {
+    const store = createStore<{ count: number }, { doubled: number }>({
+      state: { count: 1 },
+      derived: { doubled: (s) => s.count * 2 },
+    });
+    (derivedKeysOf(store) as string[]).length = 0;
+    expect(derivedKeysOf(store)).toEqual(["doubled"]);
+  });
+});
+
+// Plugin hooks are not wrapped in try/catch: a hook that throws propagates to
+// whoever triggered it and stops the hooks and subscribers ordered after it,
+// the same contract a throwing subscriber has. These pin that contract so it
+// cannot drift silently — and pin the one place it is overridden, `destroy()`,
+// which must finish tearing the store down no matter what a plugin does.
+describe("throwing plugin hooks", () => {
+  const boom = new Error("plugin exploded");
+
+  it("propagates an onInit throw out of createStore and skips later plugins", () => {
+    const laterOnInit = vi.fn();
+    const first: StoicPlugin<{ count: number }> = {
+      onInit() {
+        throw boom;
+      },
+    };
+    const second: StoicPlugin<{ count: number }> = { onInit: laterOnInit };
+
+    expect(() => createStore({ state: { count: 0 }, plugins: [first, second] })).toThrow(boom);
+    expect(laterOnInit).not.toHaveBeenCalled();
+  });
+
+  it("propagates a beforeAction throw and never runs the action body", () => {
+    const body = vi.fn();
+    const plugin: StoicPlugin<{ count: number }> = {
+      beforeAction() {
+        throw boom;
+      },
+    };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const { inc } = store.actions({
+      inc: (ctx) => {
+        body();
+        ctx.set({ count: 1 });
+      },
+    });
+
+    expect(() => inc()).toThrow(boom);
+    expect(body).not.toHaveBeenCalled();
+    expect(store.getState().count).toBe(0);
+  });
+
+  it("propagates an afterAction throw, leaving the action's meta unsettled", () => {
+    const plugin: StoicPlugin<{ count: number }> = {
+      afterAction() {
+        throw boom;
+      },
+    };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const { inc } = store.actions({ inc: (ctx) => ctx.set({ count: 1 }) });
+
+    // The write itself already landed — afterAction runs from settle(), which is
+    // reached only after the body returned.
+    expect(() => inc()).toThrow(boom);
+    expect(store.getState().count).toBe(1);
+    expect(inc.getMeta().status).toBe("pending");
+  });
+
+  it("rejects the returned promise when afterAction throws for an async action", async () => {
+    const plugin: StoicPlugin<{ count: number }> = {
+      afterAction() {
+        throw boom;
+      },
+    };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+    const { incAsync } = store.actions({
+      incAsync: async (ctx) => {
+        ctx.set({ count: 1 });
+        return "done";
+      },
+    });
+
+    await expect(incAsync()).rejects.toThrow(boom);
+    expect(store.getState().count).toBe(1);
+  });
+
+  it("propagates an afterSetState throw and skips later plugins and every subscriber", () => {
+    const laterHook = vi.fn();
+    const listener = vi.fn();
+    const first: StoicPlugin<{ count: number }> = {
+      afterSetState() {
+        throw boom;
+      },
+    };
+    const second: StoicPlugin<{ count: number }> = { afterSetState: laterHook };
+    const store = createStore({ state: { count: 0 }, plugins: [first, second] });
+    store.subscribe(listener);
+
+    expect(() => store.setState({ count: 1 })).toThrow(boom);
+    // The snapshot was swapped before notify ran, so the state itself is intact —
+    // only the announcement was cut short.
+    expect(store.getState().count).toBe(1);
+    expect(laterHook).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("propagates an onDestroy throw and skips later plugins", () => {
+    const laterOnDestroy = vi.fn();
+    const first: StoicPlugin<{ count: number }> = {
+      onDestroy() {
+        throw boom;
+      },
+    };
+    const second: StoicPlugin<{ count: number }> = { onDestroy: laterOnDestroy };
+    const store = createStore({ state: { count: 0 }, plugins: [first, second] });
+
+    expect(() => store.destroy()).toThrow(boom);
+    expect(laterOnDestroy).not.toHaveBeenCalled();
+  });
+
+  it("still tears the store down when onDestroy throws", () => {
+    // The regression this guards: destroy() sets `destroyed` first and retires
+    // the listeners last, so a throw in between left the store flagged dead
+    // while every listener stayed subscribed. Destroying from inside a dispatch
+    // is what makes that externally visible — the loop is holding a length it
+    // read before destroy() ran, and only the retired NOOP slots stop it from
+    // calling the listeners ordered after the one that destroyed the store.
+    const later = vi.fn();
+    const plugin: StoicPlugin<{ count: number }> = {
+      onDestroy() {
+        throw boom;
+      },
+    };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+
+    store.subscribe(() => {
+      try {
+        store.destroy();
+      } catch {
+        // Swallowed on purpose: an unhandled throw would unwind the dispatch
+        // loop by itself and hide whether the slots were actually retired.
+      }
+    });
+    store.subscribe(later);
+
+    store.setState({ count: 1 });
+    expect(later).not.toHaveBeenCalled();
+
+    // And the teardown is complete, not half-applied.
+    const orphan = vi.fn();
+    store.subscribe(orphan);
+    store.setState({ count: 2 });
+    expect(orphan).not.toHaveBeenCalled();
+  });
+
+  it("does not re-run onDestroy hooks after a throwing destroy()", () => {
+    const onDestroy = vi.fn(() => {
+      throw boom;
+    });
+    const plugin: StoicPlugin<{ count: number }> = { onDestroy };
+    const store = createStore({ state: { count: 0 }, plugins: [plugin] });
+
+    expect(() => store.destroy()).toThrow(boom);
+    expect(onDestroy).toHaveBeenCalledOnce();
+
+    // Idempotent: `destroyed` was set before the hooks ran, so the second call
+    // returns without touching them.
+    expect(() => store.destroy()).not.toThrow();
+    expect(onDestroy).toHaveBeenCalledOnce();
   });
 });
 
